@@ -82,8 +82,9 @@ class MatchedAlertConsumer:
         messages_consumed.inc()
         # Skeleton: log only. No gates, no submit, offset NOT committed (C9/C10/C11).
         logger.info(
-            "Consumed matched message automation_id=%s history_id=%s matched_m=%s "
+            "Consumed matched message tenant_id=%s automation_id=%s history_id=%s matched_m=%s "
             "(skeleton: no gate/submit; offset not committed)",
+            message.tenant_id,
             message.automation_id,
             message.history_id,
             message.matched_m,
