@@ -125,13 +125,36 @@ def test_first_claim_is_claimed_and_stores_pending():
     assert redis.values[decision.key] == "pending"
 
 
-def test_claim_ttl_is_24h():
+def test_claim_ttl_defaults_to_the_contract_24h():
     redis = FakeRedis()
 
     decision = gate_with(redis).claim(message())
 
-    assert redis.ttls[decision.key] == 86400
-    assert IDEMPOTENCY_TTL_SECONDS == 86400  # pinned by spec §7.6
+    assert redis.ttls[decision.key] == IDEMPOTENCY_TTL_SECONDS
+    # The env default is the contract value (spec §7.6), so an unset
+    # IDEMPOTENCY_TTL_SECONDS is always the contract-correct deployment.
+    assert IDEMPOTENCY_TTL_SECONDS == 86400
+
+
+@pytest.mark.parametrize(
+    "env_value, expected",
+    [
+        ("3600", 3600),  # overridable per environment
+        ("0", 1),        # floored: `EX 0` is a Redis error, not a short TTL
+        ("-5", 1),
+    ],
+)
+def test_ttl_env_override_is_read_and_floored(monkeypatch, env_value, expected):
+    import importlib
+
+    from src.config import consts
+
+    monkeypatch.setenv("IDEMPOTENCY_TTL_SECONDS", env_value)
+    try:
+        assert importlib.reload(consts).IDEMPOTENCY_TTL_SECONDS == expected
+    finally:
+        monkeypatch.delenv("IDEMPOTENCY_TTL_SECONDS")
+        importlib.reload(consts)
 
 
 def test_claim_uses_nx_so_it_never_overwrites_a_sibling_claim():
@@ -259,14 +282,14 @@ def test_message_without_history_id_fails_open_and_arms_nothing():
 # -- mark_done ----------------------------------------------------------------
 
 
-def test_mark_done_writes_done_with_a_fresh_24h_ttl():
+def test_mark_done_writes_done_with_a_fresh_ttl():
     redis = FakeRedis()
     gate = gate_with(redis)
     decision = gate.claim(message())
 
     assert gate.mark_done(message()) is True
     assert redis.values[decision.key] == "done"
-    assert redis.ttls[decision.key] == 86400
+    assert redis.ttls[decision.key] == IDEMPOTENCY_TTL_SECONDS
 
 
 def test_mark_done_survives_a_dead_redis():

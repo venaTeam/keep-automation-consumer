@@ -22,12 +22,17 @@ PROMETHEUS_METRICS_PORT = config("PROMETHEUS_METRICS_PORT", default="8094", cast
 # duplicate-protection and nothing else.
 REDIS_URL = config("REDIS_URL", default="")
 
-# Idempotency TTL is **pinned at 24h** by spec §7.6 / contracts §Redis keys —
-# it covers raw-topic redelivery + time-in-matched-topic + matched redelivery.
-# Deliberately NOT an env knob: an operator lowering it in one environment would
-# silently shrink the duplicate-suppression window with no signal anywhere, and
-# the value has to agree with a written contract, not with a deployment.
-IDEMPOTENCY_TTL_SECONDS = 86400
+# Idempotency TTL. The contract value is **24h** (spec §7.6 / contracts §Redis
+# keys) — it covers raw-topic redelivery + time-in-matched-topic + matched
+# redelivery. Overridable per environment; the default is the contract, so an
+# unset env is always correct. Lowering it only shrinks duplicate-suppression:
+# the DB unique constraint on `(history_id, automation_id)` stays the dedup
+# authority, so a short TTL costs extra idempotent submits, never correctness.
+# Floored at 1 — `config()` does no validation, and `EX 0` is a Redis error
+# ("invalid expire time") that would fail the claim on every message.
+IDEMPOTENCY_TTL_SECONDS = max(
+    1, config("IDEMPOTENCY_TTL_SECONDS", default="86400", cast=int)
+)
 
 # Hot-path bounds for every Redis call the gates make. The gate runs inside the
 # Kafka poll loop, so an unreachable-but-not-refusing Redis must fail fast

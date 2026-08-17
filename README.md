@@ -31,6 +31,11 @@ lost automation. `done` is written only on an **API-confirmed** submit
 (`mark_done`, wired in C11); there is no `release()` on failure, because
 `pending` already routes a redelivery to a submit.
 
+Config: `REDIS_URL` (empty = fail open), `IDEMPOTENCY_TTL_SECONDS` (default
+`86400` — the contract value; floored at 1 since `EX 0` is a Redis error),
+`REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS` / `REDIS_SOCKET_TIMEOUT_SECONDS`
+(default `1.0` each — the gate runs inside the poll loop).
+
 Metrics: `keep_automation_consumer_idempotency_decisions_total{outcome}`,
 `keep_automation_consumer_redis_errors_total{operation}` (the Redis-down signal).
 
