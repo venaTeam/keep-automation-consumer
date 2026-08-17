@@ -1,5 +1,5 @@
 """Prometheus metrics for the consumer (skeleton set)."""
-from prometheus_client import Counter
+from prometheus_client import Counter, Gauge
 
 messages_consumed = Counter(
     "keep_automation_consumer_messages_consumed_total",
@@ -28,3 +28,24 @@ redis_errors = Counter(
     "Redis operations that failed (gates then fail open)",
     ["operation"],
 )
+
+# Set at startup: 1 when a gate dependency is not configured at all. Without it,
+# a consumer deployed with no REDIS_URL runs 100% ungated and looks identical to
+# a healthy one — `redis_errors` never fires, because nothing is ever attempted.
+# Mirrors keep-event-handler's `automation_index_config_missing`.
+gates_config_missing = Gauge(
+    "keep_automation_consumer_gates_config_missing",
+    "1 when a gate dependency is unconfigured (gates then fail open)",
+    ["setting"],
+)
+
+# Open the label children up front. `prometheus_client` does not emit a labelled
+# child until it is first touched, so an alert written as
+# `rate(redis_errors{operation="claim"}[5m]) > 0` reads "no data" for
+# not-deployed, no-traffic AND misconfigured alike. Pre-initialising makes an
+# absent series mean "not scraped", nothing else.
+for _operation in ("claim", "get", "mark_done"):
+    redis_errors.labels(operation=_operation)
+for _outcome in ("claimed", "duplicate", "ambiguous", "fail_open"):
+    idempotency_decisions.labels(outcome=_outcome)
+gates_config_missing.labels(setting="redis_url")

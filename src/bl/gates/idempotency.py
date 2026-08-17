@@ -26,15 +26,24 @@ There is deliberately no `release()`: a clean API failure leaves the key at
 provisional-then-release dance belongs to the cooldown key (C10), whose failure
 mode — suppressing a *different* event — is not covered by any DB constraint.
 
-Nothing here raises. Every Redis error becomes `FAIL_OPEN` plus a metric.
+Nothing here raises. Every Redis error becomes `FAIL_OPEN` plus a metric — and
+after `REDIS_BREAKER_FAILURE_THRESHOLD` consecutive failures the breaker
+short-circuits without touching the socket, because socket timeouts bound one
+message's latency but not the loop's throughput.
 """
 
 import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from src.config.consts import IDEMPOTENCY_TTL_SECONDS
+from src.config.consts import (
+    IDEMPOTENCY_TTL_SECONDS,
+    REDIS_BREAKER_FAILURE_THRESHOLD,
+    REDIS_BREAKER_OPEN_SECONDS,
+    REDIS_ERROR_LOG_INTERVAL_SECONDS,
+)
 from src.core.metrics import idempotency_decisions, redis_errors
 from src.core.redis_client import get_redis_client
 from src.models.matched_message import MatchedAlertMessage
@@ -79,8 +88,57 @@ def idempotency_key(history_id: str, automation_id: str) -> str:
 
 
 class IdempotencyGate:
-    def __init__(self, client_factory=get_redis_client):
+    def __init__(self, client_factory=get_redis_client, clock=time.monotonic):
         self._client_factory = client_factory
+        self._clock = clock
+        self._consecutive_failures = 0
+        self._breaker_open_until = 0.0
+        self._next_error_log_at = 0.0
+
+    # -- circuit breaker ---------------------------------------------------
+    #
+    # Deliberately lock-free. Under the C11 worker pool several threads race on
+    # these two attributes, and the worst outcome of a lost update is one extra
+    # probe or one extra skipped call — the gate is advisory either way, so a
+    # lock on the hot path would cost more than the race.
+
+    @property
+    def _breaker_is_open(self) -> bool:
+        return self._clock() < self._breaker_open_until
+
+    def _record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._breaker_open_until = 0.0
+
+    def _record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= REDIS_BREAKER_FAILURE_THRESHOLD:
+            self._breaker_open_until = self._clock() + REDIS_BREAKER_OPEN_SECONDS
+            # Half-open: the counter resets with the window, so the first
+            # message after it expires probes Redis for real, and a single
+            # further failure re-opens the breaker immediately.
+            self._consecutive_failures = 0
+
+    def _log_redis_error(self, operation: str, key: str) -> None:
+        """Budgeted traceback: the metric counts every failure, the log doesn't.
+
+        A Redis outage at ~200 msg/s writes 200 stack traces/s synchronously
+        from inside the poll loop otherwise — the noise itself becomes the
+        outage. Same reasoning keep-event-handler's pubsub listener applies to
+        its reconnect loop.
+        """
+        now = self._clock()
+        if now >= self._next_error_log_at:
+            self._next_error_log_at = now + REDIS_ERROR_LOG_INTERVAL_SECONDS
+            logger.exception(
+                "automations: idempotency %s failed for key=%s; failing open "
+                "(further tracebacks suppressed for %ss)",
+                operation,
+                key,
+                REDIS_ERROR_LOG_INTERVAL_SECONDS,
+            )
+        else:
+            logger.debug("automations: idempotency %s failed for key=%s", operation, key)
 
     def claim(self, message: MatchedAlertMessage) -> IdempotencyDecision:
         history_id = message.history_id
@@ -101,25 +159,35 @@ class IdempotencyGate:
             )
             return self._decide(IdempotencyOutcome.FAIL_OPEN, key, "missing_history_id")
 
-        client = self._client_factory()
-        if client is None:
+        if self._breaker_is_open:
+            # Redis is known-sick; skip the socket entirely rather than pay a
+            # timeout per message. Counted as fail-open, not as a new error.
             return self._decide(
                 IdempotencyOutcome.FAIL_OPEN, key, REASON_REDIS_UNAVAILABLE
             )
 
         try:
+            # The factory is inside the try on purpose: `get_redis_client()`
+            # swallows its own failures today, but this gate must not depend on
+            # a *different* module's guarantee to keep its "nothing raises"
+            # contract — an injected factory (C11, tests) may raise.
+            client = self._client_factory()
+            if client is None:
+                return self._decide(
+                    IdempotencyOutcome.FAIL_OPEN, key, REASON_REDIS_UNAVAILABLE
+                )
             claimed = client.set(
                 key, VALUE_PENDING, nx=True, ex=IDEMPOTENCY_TTL_SECONDS
             )
         except Exception:  # noqa: BLE001 - a gate never fails the message
             redis_errors.labels(operation="claim").inc()
-            logger.exception(
-                "automations: idempotency claim failed for key=%s; failing open", key
-            )
+            self._record_failure()
+            self._log_redis_error("claim", key)
             return self._decide(
                 IdempotencyOutcome.FAIL_OPEN, key, REASON_REDIS_UNAVAILABLE
             )
 
+        self._record_success()
         if claimed:
             return self._decide(IdempotencyOutcome.CLAIMED, key)
 
@@ -131,9 +199,8 @@ class IdempotencyGate:
             value = client.get(key)
         except Exception:  # noqa: BLE001
             redis_errors.labels(operation="get").inc()
-            logger.exception(
-                "automations: idempotency read failed for key=%s; failing open", key
-            )
+            self._record_failure()
+            self._log_redis_error("read", key)
             return self._decide(
                 IdempotencyOutcome.FAIL_OPEN, key, REASON_REDIS_UNAVAILABLE
             )
@@ -156,25 +223,24 @@ class IdempotencyGate:
         in Postgres, and a lost `done` costs one extra idempotent submit.
         """
         history_id = message.history_id
-        if not history_id:
-            return False
-
-        client = self._client_factory()
-        if client is None:
+        if not history_id or self._breaker_is_open:
             return False
 
         key = idempotency_key(history_id, message.automation_id)
         try:
+            client = self._client_factory()
+            if client is None:
+                return False
             client.set(key, VALUE_DONE, ex=IDEMPOTENCY_TTL_SECONDS)
-            return True
         except Exception:  # noqa: BLE001
             redis_errors.labels(operation="mark_done").inc()
-            logger.exception(
-                "automations: could not mark idempotency key=%s done; a redelivery "
-                "will re-submit and the DB constraint will absorb it",
-                key,
-            )
+            self._record_failure()
+            self._log_redis_error("mark_done", key)
+            # A redelivery will re-submit and the DB constraint will absorb it.
             return False
+
+        self._record_success()
+        return True
 
     @staticmethod
     def _decide(

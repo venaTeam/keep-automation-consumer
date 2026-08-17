@@ -23,7 +23,12 @@ from src.config.consts import (
     KAFKA_POLL_TIMEOUT_SECONDS,
     MATCHED_ALERTS_TOPIC,
 )
-from src.core.metrics import deserialize_errors, messages_consumed
+from src.core.metrics import (
+    deserialize_errors,
+    gates_config_missing,
+    messages_consumed,
+)
+from src.core.redis_client import redis_configured
 from src.models.matched_message import MatchedAlertMessage
 
 logger = logging.getLogger(__name__)
@@ -69,6 +74,7 @@ class MatchedAlertConsumer:
             MATCHED_ALERTS_TOPIC,
             KAFKA_CONSUMER_GROUP,
         )
+        self._report_gate_configuration()
         try:
             while self._running:
                 msg = self._consumer.poll(KAFKA_POLL_TIMEOUT_SECONDS)
@@ -77,7 +83,17 @@ class MatchedAlertConsumer:
                 if msg.error():
                     logger.error("Kafka error: %s", msg.error())
                     continue
-                self._handle(msg.value())
+                try:
+                    self._handle(msg.value())
+                except Exception:  # noqa: BLE001
+                    # One bad message must never kill the loop. Without this,
+                    # an exception escaping `_handle` exits the process, the
+                    # uncommitted offset is redelivered to the restarted pod,
+                    # and the same message poisons it again — a crashloop that
+                    # stalls the whole partition.
+                    logger.exception(
+                        "Unhandled error processing a matched message; skipping it"
+                    )
         finally:
             self._consumer.close()
             logger.info("Consumer closed")
@@ -97,14 +113,26 @@ class MatchedAlertConsumer:
             # A previous delivery of this same event reached a confirmed submit.
             # Nothing is sent to the API; the suppression is audited so it is
             # visible rather than silent (spec §7.5). C11 commits the offset here.
-            self._suppression_auditor.record_suppression(
-                tenant_id=message.tenant_id,
-                automation_id=message.automation_id,
-                history_id=message.history_id,
-                fingerprint=message.fingerprint,
-                reason=REASON_DUPLICATE,
-                gate_flags=decision.gate_flags,
-            )
+            try:
+                self._suppression_auditor.record_suppression(
+                    tenant_id=message.tenant_id,
+                    automation_id=message.automation_id,
+                    history_id=message.history_id,
+                    fingerprint=message.fingerprint,
+                    reason=REASON_DUPLICATE,
+                    gate_flags=decision.gate_flags,
+                )
+            except Exception:  # noqa: BLE001
+                # D17 replaces the stub with an HTTP client that will raise on
+                # a 503. A failed audit must not fail the message: the run
+                # already happened, and re-submitting it is the worse outcome.
+                logger.exception(
+                    "automations: could not audit a suppressed duplicate "
+                    "tenant_id=%s automation_id=%s history_id=%s",
+                    message.tenant_id,
+                    message.automation_id,
+                    message.history_id,
+                )
             return
 
         # Claimed, ambiguous, or fail-open — all three submit (C11). Until the
@@ -118,6 +146,25 @@ class MatchedAlertConsumer:
             message.history_id,
             message.matched_m,
             decision.outcome.value,
+        )
+
+    def _report_gate_configuration(self) -> None:
+        """Say once, at startup, whether the gates are configured at all.
+
+        An unset `REDIS_URL` is silent otherwise: every message fails open,
+        `redis_errors` never increments (nothing is attempted), and the pod
+        looks healthy while running 100% ungated. Same signal shape as
+        keep-event-handler's `automation_index_config_missing`.
+        """
+        if redis_configured():
+            gates_config_missing.labels(setting="redis_url").set(0)
+            return
+        gates_config_missing.labels(setting="redis_url").set(1)
+        logger.warning(
+            "automations: REDIS_URL is not set — the idempotency gate is "
+            "disabled and every message will be submitted ungated (fail-open). "
+            "Duplicate protection falls entirely to the API's unique "
+            "(history_id, automation_id) constraint."
         )
 
     def stop(self) -> None:

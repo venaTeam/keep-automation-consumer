@@ -34,14 +34,35 @@ IDEMPOTENCY_TTL_SECONDS = max(
     1, config("IDEMPOTENCY_TTL_SECONDS", default="86400", cast=int)
 )
 
-# Hot-path bounds for every Redis call the gates make. The gate runs inside the
-# Kafka poll loop, so an unreachable-but-not-refusing Redis must fail fast
-# rather than push the loop toward `max.poll.interval.ms` (the rebalance-storm
-# shape ADR-007 documents for keep-event-handler). Fail-open makes a timeout
-# cheap: we submit without the gate.
+# Hot-path bounds for every Redis call the gates make. A timeout that fires is
+# not protection, it is the cost: a blackholed Redis (SG drop, NLB draining,
+# partition) charges the full connect timeout to EVERY message, so at the ~200
+# msg/s target (spec §2.3) a 1s bound would drain the topic at ~1 msg/s. A
+# healthy p99 is well under 1ms, so 0.25s is ~250x headroom and caps the
+# blackhole case at ~4 msg/s per attempt — the breaker below carries the rest.
 REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = config(
-    "REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS", default="1.0", cast=float
+    "REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS", default="0.25", cast=float
 )
 REDIS_SOCKET_TIMEOUT_SECONDS = config(
-    "REDIS_SOCKET_TIMEOUT_SECONDS", default="1.0", cast=float
+    "REDIS_SOCKET_TIMEOUT_SECONDS", default="0.25", cast=float
+)
+
+# Circuit breaker on the gate's Redis calls. Timeouts bound one message; they do
+# not bound throughput — without this, a sick Redis costs a socket timeout on
+# every message forever, and the gate is an optimisation, never the authority.
+# An unavailable optimisation must cost ~0. After N consecutive failures the
+# gate short-circuits to fail-open without touching the socket, then lets one
+# message probe when the window expires (half-open).
+REDIS_BREAKER_FAILURE_THRESHOLD = max(
+    1, config("REDIS_BREAKER_FAILURE_THRESHOLD", default="5", cast=int)
+)
+REDIS_BREAKER_OPEN_SECONDS = max(
+    1.0, config("REDIS_BREAKER_OPEN_SECONDS", default="10.0", cast=float)
+)
+
+# Traceback budget for the gate's Redis errors: a Redis outage at 200 msg/s
+# would otherwise write 200 stack traces/s synchronously from the poll loop.
+# The metric counts every failure; only the logging is budgeted.
+REDIS_ERROR_LOG_INTERVAL_SECONDS = max(
+    0.0, config("REDIS_ERROR_LOG_INTERVAL_SECONDS", default="30.0", cast=float)
 )

@@ -31,13 +31,27 @@ lost automation. `done` is written only on an **API-confirmed** submit
 (`mark_done`, wired in C11); there is no `release()` on failure, because
 `pending` already routes a redelivery to a submit.
 
-Config: `REDIS_URL` (empty = fail open), `IDEMPOTENCY_TTL_SECONDS` (default
-`86400` — the contract value; floored at 1 since `EX 0` is a Redis error),
-`REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS` / `REDIS_SOCKET_TIMEOUT_SECONDS`
-(default `1.0` each — the gate runs inside the poll loop).
+Redis being sick must cost ~0, not a timeout per message: socket timeouts bound
+one message's latency, and a **circuit breaker** bounds the loop's throughput —
+after `REDIS_BREAKER_FAILURE_THRESHOLD` consecutive failures the gate
+short-circuits to fail-open without touching the socket, then lets one message
+probe when the window expires. Redis-error tracebacks are budgeted (the metric
+counts every failure; the log doesn't).
+
+| Env var | Default | |
+|---|---|---|
+| `REDIS_URL` | *(empty)* | Empty = gates disabled, everything fails open |
+| `IDEMPOTENCY_TTL_SECONDS` | `86400` | The contract value; floored at 1 (`EX 0` is a Redis error) |
+| `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS` / `REDIS_SOCKET_TIMEOUT_SECONDS` | `0.25` | The gate runs inside the poll loop |
+| `REDIS_BREAKER_FAILURE_THRESHOLD` / `REDIS_BREAKER_OPEN_SECONDS` | `5` / `10.0` | Circuit breaker |
+| `REDIS_ERROR_LOG_INTERVAL_SECONDS` | `30.0` | Traceback budget |
 
 Metrics: `keep_automation_consumer_idempotency_decisions_total{outcome}`,
-`keep_automation_consumer_redis_errors_total{operation}` (the Redis-down signal).
+`keep_automation_consumer_redis_errors_total{operation}` (the Redis-down
+signal), `keep_automation_consumer_gates_config_missing{setting}` (1 when
+`REDIS_URL` is unset — "unconfigured" and "down" must be separable, and label
+children are pre-initialised so an absent series only ever means "not
+scraped").
 
 Suppression audit rows go through `src/bl/suppression_audit.py` — a Protocol
 with a logging stub until D17/D19 expose the endpoint.
