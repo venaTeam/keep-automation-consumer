@@ -5,11 +5,37 @@ Consumer service for the Keep **Automations** feature. It reads the
 the automation API's idempotent submit endpoint — committing the matched-topic
 offset only after an API-confirmed submit.
 
-> **Status: C8 skeleton.** Currently only the service shell + a Kafka consume loop
-> that **consumes and logs** matched messages. Offsets are **never committed**
-> (`enable.auto.commit=false`) and there are no gates or submit calls yet —
-> those land in C9 (idempotency), C10 (cooldown), C11 (submit + offset commit +
-> fail-open).
+> **Status: C8 skeleton + C9 idempotency gate.** The consume loop runs the
+> idempotency gate per message and logs the decision (duplicates are audited,
+> everything else would submit). Offsets are still **never committed**
+> (`enable.auto.commit=false`) and no submit call exists yet — those land in
+> C10 (cooldown) and C11 (submit + offset commit + fail-open).
+
+## Idempotency gate (C9)
+
+`SET idem:{history_id}:{automation_id} "pending" NX EX 24h` per message
+(`automation-contracts.md` §Redis keys, spec §5.2 step 1):
+
+| Redis says | Outcome | Action |
+|---|---|---|
+| NX succeeded | `claimed` | submit |
+| NX failed, value `done` | `duplicate` | audit `suppressed`(duplicate), commit offset, **no** submit |
+| NX failed, value `pending` or key gone | `ambiguous` | **submit** |
+| unreachable / `REDIS_URL` unset | `fail_open` | **submit**, `gate_flags={idempotency: skipped, reason: redis_unavailable}` |
+
+The gate is an optimisation, never the authority: the API's unique
+`(history_id, automation_id)` constraint is what actually dedups, and it
+short-circuits to `200 already submitted` without calling `/run`. So every
+ambiguous case submits — dropping a message would trade a cheap duplicate for a
+lost automation. `done` is written only on an **API-confirmed** submit
+(`mark_done`, wired in C11); there is no `release()` on failure, because
+`pending` already routes a redelivery to a submit.
+
+Metrics: `keep_automation_consumer_idempotency_decisions_total{outcome}`,
+`keep_automation_consumer_redis_errors_total{operation}` (the Redis-down signal).
+
+Suppression audit rows go through `src/bl/suppression_audit.py` — a Protocol
+with a logging stub until D17/D19 expose the endpoint.
 
 ## Layout (mirrors keep-event-handler)
 
@@ -18,9 +44,11 @@ offset only after an API-confirmed submit.
 | `src/consumer_main.py` | Standalone entrypoint: metrics server + health server + blocking consume loop. |
 | `src/main.py` | FastAPI health/metrics app (K8s probes / scrape). |
 | `src/core/kafka_consumer.py` | Consumer (auto-commit off) → subscribe → poll → deserialize → log. |
-| `src/config/` | Env config + constants (topic, group, ports, worker-pool size). |
+| `src/config/` | Env config + constants (topic, group, ports, worker-pool size, Redis). |
+| `src/core/redis_client.py` | Process-lifetime Redis client (build once — a per-call pool leaks fds). |
 | `src/models/matched_message.py` | Matched-message shape (contracts §"Matched message"). |
-| `src/bl/` | Placeholder for gates (C9/C10) + submit pipeline (C11). |
+| `src/bl/gates/idempotency.py` | Idempotency gate (C9). Cooldown (C10) lands beside it. |
+| `src/bl/suppression_audit.py` | Suppression audit Protocol + logging stub (D17 swaps it). |
 
 Ports: health **8092**, metrics **8094**.
 
@@ -28,6 +56,7 @@ Ports: health **8092**, metrics **8094**.
 
 ```bash
 docker compose -f docker-compose.infra.yml up -d   # kafka + zookeeper
+export REDIS_URL=redis://localhost:6379            # gates; unset = fail open
 poetry install
 poetry run python -m src.consumer_main             # start the consume loop
 # in another shell, produce a test message to the matched-alerts topic
