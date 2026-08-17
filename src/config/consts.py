@@ -15,3 +15,28 @@ WORKER_POOL_SIZE = config("WORKER_POOL_SIZE", default="200", cast=int)
 # Ports (event-handler convention: health 8092, metrics 8094).
 HEALTH_CHECK_PORT = config("HEALTH_CHECK_PORT", default="8092", cast=int)
 PROMETHEUS_METRICS_PORT = config("PROMETHEUS_METRICS_PORT", default="8094", cast=int)
+
+# Redis — idempotency + cooldown gates (contracts §"Environment & endpoints").
+# Empty is a supported state, not a misconfiguration to crash on: the gates are
+# best-effort and fail open (spec §4.5, §6.3), so an unset URL degrades
+# duplicate-protection and nothing else.
+REDIS_URL = config("REDIS_URL", default="")
+
+# Idempotency TTL is **pinned at 24h** by spec §7.6 / contracts §Redis keys —
+# it covers raw-topic redelivery + time-in-matched-topic + matched redelivery.
+# Deliberately NOT an env knob: an operator lowering it in one environment would
+# silently shrink the duplicate-suppression window with no signal anywhere, and
+# the value has to agree with a written contract, not with a deployment.
+IDEMPOTENCY_TTL_SECONDS = 86400
+
+# Hot-path bounds for every Redis call the gates make. The gate runs inside the
+# Kafka poll loop, so an unreachable-but-not-refusing Redis must fail fast
+# rather than push the loop toward `max.poll.interval.ms` (the rebalance-storm
+# shape ADR-007 documents for keep-event-handler). Fail-open makes a timeout
+# cheap: we submit without the gate.
+REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = config(
+    "REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS", default="1.0", cast=float
+)
+REDIS_SOCKET_TIMEOUT_SECONDS = config(
+    "REDIS_SOCKET_TIMEOUT_SECONDS", default="1.0", cast=float
+)
