@@ -26,9 +26,10 @@ from src.config.consts import (
 from src.core.metrics import (
     deserialize_errors,
     gates_config_missing,
+    handle_errors,
     messages_consumed,
 )
-from src.core.redis_client import redis_configured
+from src.core.redis_client import get_redis_client, redis_configured
 from src.models.matched_message import MatchedAlertMessage
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,7 @@ class MatchedAlertConsumer:
                     # uncommitted offset is redelivered to the restarted pod,
                     # and the same message poisons it again — a crashloop that
                     # stalls the whole partition.
+                    handle_errors.inc()
                     logger.exception(
                         "Unhandled error processing a matched message; skipping it"
                     )
@@ -156,16 +158,33 @@ class MatchedAlertConsumer:
         looks healthy while running 100% ungated. Same signal shape as
         keep-event-handler's `automation_index_config_missing`.
         """
-        if redis_configured():
-            gates_config_missing.labels(setting="redis_url").set(0)
+        if not redis_configured():
+            gates_config_missing.labels(setting="redis_url").set(1)
+            gates_config_missing.labels(setting="redis_client").set(1)
+            logger.warning(
+                "automations: REDIS_URL is not set — the idempotency gate is "
+                "disabled and every message will be submitted ungated "
+                "(fail-open). Duplicate protection falls entirely to the API's "
+                "unique (history_id, automation_id) constraint."
+            )
             return
-        gates_config_missing.labels(setting="redis_url").set(1)
-        logger.warning(
-            "automations: REDIS_URL is not set — the idempotency gate is "
-            "disabled and every message will be submitted ungated (fail-open). "
-            "Duplicate protection falls entirely to the API's unique "
-            "(history_id, automation_id) constraint."
-        )
+
+        gates_config_missing.labels(setting="redis_url").set(0)
+        # A URL alone does not mean the gate is armed: a typo'd scheme or a
+        # missing driver produces an unbuildable client that fails open on
+        # every message *without* incrementing `redis_errors` (nothing is ever
+        # attempted). Building it here moves that failure — and its traceback —
+        # to startup, where operators look, and keeps the gauge honest instead
+        # of reporting "armed" for a permanently ungated consumer.
+        if get_redis_client() is None:
+            gates_config_missing.labels(setting="redis_client").set(1)
+            logger.warning(
+                "automations: REDIS_URL is set but the Redis client could not "
+                "be built — the idempotency gate is disabled for the life of "
+                "this process (fail-open). Fix the configuration and restart."
+            )
+            return
+        gates_config_missing.labels(setting="redis_client").set(0)
 
     def stop(self) -> None:
         self._running = False

@@ -88,3 +88,98 @@ def test_tenantless_message_is_counted_as_a_deserialize_error():
     assert (
         _counter("keep_automation_consumer_messages_consumed_total") == consumed_before
     )
+
+
+# -- poll loop resilience -----------------------------------------------------
+#
+# `start()` is the outermost guard: whatever escapes `_handle` decides between
+# "skip one message" and "exit the process, get redelivered the same poison
+# message on restart, and stall the partition". C11 adds submit + offset commit
+# inside that same path, so the guard has to be pinned before it does.
+
+
+class _FakeMessage:
+    def __init__(self, value=b"{}", error=None):
+        self._value = value
+        self._error = error
+
+    def error(self):
+        return self._error
+
+    def value(self):
+        return self._value
+
+
+class _FakeKafkaConsumer:
+    """Yields a scripted list of poll() results, then stops the loop."""
+
+    def __init__(self, messages, on_exhausted):
+        self._messages = list(messages)
+        self._on_exhausted = on_exhausted
+        self.subscribed = None
+        self.closed = False
+
+    def subscribe(self, topics):
+        self.subscribed = topics
+
+    def poll(self, _timeout):
+        if self._messages:
+            return self._messages.pop(0)
+        self._on_exhausted()
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+def _run_loop(consumer, messages):
+    fake = _FakeKafkaConsumer(messages, on_exhausted=consumer.stop)
+    consumer._create_consumer = lambda: fake
+    consumer.start()
+    return fake
+
+
+def test_a_raising_handle_does_not_kill_the_poll_loop(monkeypatch):
+    monkeypatch.setattr(MatchedAlertConsumer, "_report_gate_configuration", lambda _: None)
+    handled = []
+
+    consumer = MatchedAlertConsumer()
+    def explode_on_first(raw):
+        handled.append(raw)
+        if len(handled) == 1:
+            raise RuntimeError("poison message")
+
+    consumer._handle = explode_on_first
+    errors_before = _counter("keep_automation_consumer_handle_errors_total")
+
+    fake = _run_loop(consumer, [_FakeMessage(b"first"), _FakeMessage(b"second")])
+
+    assert handled == [b"first", b"second"]  # the loop survived and moved on
+    assert fake.closed is True
+    assert (
+        _counter("keep_automation_consumer_handle_errors_total") == errors_before + 1
+    )
+
+
+def test_start_reports_the_gate_configuration_before_consuming():
+    """The unconfigured-Redis warning must land at startup, not on message 1."""
+    consumer = MatchedAlertConsumer()
+    order = []
+
+    consumer._report_gate_configuration = lambda: order.append("reported")
+    consumer._handle = lambda raw: order.append("handled")
+
+    _run_loop(consumer, [_FakeMessage(b"first")])
+
+    assert order == ["reported", "handled"]
+
+
+def test_kafka_errors_are_logged_without_reaching_the_gate(monkeypatch):
+    monkeypatch.setattr(MatchedAlertConsumer, "_report_gate_configuration", lambda _: None)
+    consumer = MatchedAlertConsumer()
+    handled = []
+    consumer._handle = handled.append
+
+    _run_loop(consumer, [_FakeMessage(error="broker went away")])
+
+    assert handled == []

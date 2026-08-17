@@ -114,10 +114,13 @@ class IdempotencyGate:
         self._consecutive_failures += 1
         if self._consecutive_failures >= REDIS_BREAKER_FAILURE_THRESHOLD:
             self._breaker_open_until = self._clock() + REDIS_BREAKER_OPEN_SECONDS
-            # Half-open: the counter resets with the window, so the first
-            # message after it expires probes Redis for real, and a single
-            # further failure re-opens the breaker immediately.
-            self._consecutive_failures = 0
+            # Half-open: park the counter one short of the threshold, so the
+            # first message after the window probes Redis for real and a single
+            # failed probe re-opens immediately. Resetting to 0 here instead
+            # would charge THRESHOLD timeouts per window for the whole outage —
+            # 5x the documented cost — while a success still zeroes the counter
+            # via `_record_success`, so a recovered Redis is not penalised.
+            self._consecutive_failures = REDIS_BREAKER_FAILURE_THRESHOLD - 1
 
     def _log_redis_error(self, operation: str, key: str) -> None:
         """Budgeted traceback: the metric counts every failure, the log doesn't.

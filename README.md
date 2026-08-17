@@ -46,12 +46,15 @@ counts every failure; the log doesn't).
 | `REDIS_BREAKER_FAILURE_THRESHOLD` / `REDIS_BREAKER_OPEN_SECONDS` | `5` / `10.0` | Circuit breaker |
 | `REDIS_ERROR_LOG_INTERVAL_SECONDS` | `30.0` | Traceback budget |
 
-Metrics: `keep_automation_consumer_idempotency_decisions_total{outcome}`,
-`keep_automation_consumer_redis_errors_total{operation}` (the Redis-down
-signal), `keep_automation_consumer_gates_config_missing{setting}` (1 when
-`REDIS_URL` is unset — "unconfigured" and "down" must be separable, and label
-children are pre-initialised so an absent series only ever means "not
-scraped").
+Metrics — label children are pre-initialised, so an absent series only ever
+means "not scraped":
+
+| Metric | |
+|---|---|
+| `..._idempotency_decisions_total{outcome}` | `claimed` / `duplicate` / `ambiguous` / `fail_open`. **Ungated volume is this metric's `fail_open`, not `redis_errors`** — once the breaker is open no Redis call is attempted, so the error counter stops scaling with traffic |
+| `..._redis_errors_total{operation}` | the Redis-down signal (`claim` / `get` / `mark_done`) |
+| `..._gates_config_missing{setting}` | set at startup. `redis_url` = no URL configured; `redis_client` = URL set but the client could not be built (a typo'd scheme or missing driver is 100% ungated and would otherwise increment nothing) |
+| `..._handle_errors_total` | messages whose processing raised and were skipped by the poll-loop guard |
 
 Suppression audit rows go through `src/bl/suppression_audit.py` — a Protocol
 with a logging stub until D17/D19 expose the endpoint.

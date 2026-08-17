@@ -26,6 +26,7 @@ from src.config.consts import (
     IDEMPOTENCY_TTL_SECONDS,
     REDIS_BREAKER_FAILURE_THRESHOLD,
     REDIS_BREAKER_OPEN_SECONDS,
+    REDIS_ERROR_LOG_INTERVAL_SECONDS,
 )
 from src.core.kafka_consumer import MatchedAlertConsumer
 from src.models.matched_message import MatchedAlertMessage
@@ -324,6 +325,15 @@ def test_mark_done_survives_a_dead_redis():
     assert gate_with(None).mark_done(message()) is False
 
 
+def test_mark_done_survives_a_raising_client_factory():
+    """Same guard as `claim`: the factory call belongs inside the try."""
+
+    def angry_factory():
+        raise RuntimeError("client construction blew up")
+
+    assert IdempotencyGate(client_factory=angry_factory).mark_done(message()) is False
+
+
 # -- decision metric ----------------------------------------------------------
 
 
@@ -472,6 +482,39 @@ def test_a_success_resets_the_failure_run():
     gate.claim(message())
 
     assert len(redis.calls) > calls_before  # breaker never opened
+
+
+def test_one_failed_probe_reopens_the_breaker():
+    """The half-open probe is one message per window, not THRESHOLD of them."""
+    clock = Clock()
+    gate, redis = failing_gate(clock)
+    for _ in range(REDIS_BREAKER_FAILURE_THRESHOLD):
+        gate.claim(message())
+
+    clock.advance(REDIS_BREAKER_OPEN_SECONDS + 1)
+    calls_before = len(redis.calls)
+    for _ in range(10):
+        gate.claim(message())
+
+    # Exactly one socket touch: the probe. The other nine short-circuited.
+    assert len(redis.calls) == calls_before + 1
+
+
+def test_redis_errors_are_logged_once_per_budget_window(caplog):
+    """A Redis outage at 200 msg/s must not write 200 tracebacks/s."""
+    clock = Clock()
+    gate, _ = failing_gate(clock)
+
+    with caplog.at_level(logging.ERROR, logger="src.bl.gates.idempotency"):
+        gate.claim(message())
+        gate.claim(message())
+        gate.claim(message())
+        assert len(caplog.records) == 1
+
+        clock.advance(REDIS_ERROR_LOG_INTERVAL_SECONDS + 1)
+        gate.claim(message())
+
+    assert len(caplog.records) == 2
 
 
 def test_mark_done_is_skipped_while_the_breaker_is_open():

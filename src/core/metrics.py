@@ -48,4 +48,14 @@ for _operation in ("claim", "get", "mark_done"):
     redis_errors.labels(operation=_operation)
 for _outcome in ("claimed", "duplicate", "ambiguous", "fail_open"):
     idempotency_decisions.labels(outcome=_outcome)
-gates_config_missing.labels(setting="redis_url")
+for _setting in ("redis_url", "redis_client"):
+    gates_config_missing.labels(setting=_setting)
+
+# Messages whose processing raised. Today the poll loop logs and moves on, and
+# the offset is uncommitted so the message is redelivered — but C11 commits
+# inside that same path, at which point this counter is the only evidence a
+# message was skipped. Added with the guard, not after it.
+handle_errors = Counter(
+    "keep_automation_consumer_handle_errors_total",
+    "Matched-alert messages whose processing raised and was skipped",
+)
