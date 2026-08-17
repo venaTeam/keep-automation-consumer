@@ -1,5 +1,6 @@
 """C8 skeleton tests: consumer config + matched-message parsing."""
 import json
+import signal
 
 import pytest
 from prometheus_client import REGISTRY
@@ -132,7 +133,11 @@ class _FakeKafkaConsumer:
         self.closed = True
 
 
-def _run_loop(consumer, messages):
+def _run_loop(consumer, messages, monkeypatch):
+    # `start()` installs process-global SIGINT/SIGTERM handlers. Left in place,
+    # the pytest session's Ctrl-C would end up bound to a dead consumer's
+    # stop().
+    monkeypatch.setattr(signal, "signal", lambda *_: None)
     fake = _FakeKafkaConsumer(messages, on_exhausted=consumer.stop)
     consumer._create_consumer = lambda: fake
     consumer.start()
@@ -152,7 +157,7 @@ def test_a_raising_handle_does_not_kill_the_poll_loop(monkeypatch):
     consumer._handle = explode_on_first
     errors_before = _counter("keep_automation_consumer_handle_errors_total")
 
-    fake = _run_loop(consumer, [_FakeMessage(b"first"), _FakeMessage(b"second")])
+    fake = _run_loop(consumer, [_FakeMessage(b"first"), _FakeMessage(b"second")], monkeypatch)
 
     assert handled == [b"first", b"second"]  # the loop survived and moved on
     assert fake.closed is True
@@ -161,7 +166,7 @@ def test_a_raising_handle_does_not_kill_the_poll_loop(monkeypatch):
     )
 
 
-def test_start_reports_the_gate_configuration_before_consuming():
+def test_start_reports_the_gate_configuration_before_consuming(monkeypatch):
     """The unconfigured-Redis warning must land at startup, not on message 1."""
     consumer = MatchedAlertConsumer()
     order = []
@@ -169,7 +174,7 @@ def test_start_reports_the_gate_configuration_before_consuming():
     consumer._report_gate_configuration = lambda: order.append("reported")
     consumer._handle = lambda raw: order.append("handled")
 
-    _run_loop(consumer, [_FakeMessage(b"first")])
+    _run_loop(consumer, [_FakeMessage(b"first")], monkeypatch)
 
     assert order == ["reported", "handled"]
 
@@ -180,6 +185,6 @@ def test_kafka_errors_are_logged_without_reaching_the_gate(monkeypatch):
     handled = []
     consumer._handle = handled.append
 
-    _run_loop(consumer, [_FakeMessage(error="broker went away")])
+    _run_loop(consumer, [_FakeMessage(error="broker went away")], monkeypatch)
 
     assert handled == []

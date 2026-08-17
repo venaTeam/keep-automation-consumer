@@ -539,29 +539,41 @@ def test_unconfigured_redis_raises_the_config_gauge_and_warns(monkeypatch, caplo
     with caplog.at_level(logging.WARNING, logger="src.core.kafka_consumer"):
         MatchedAlertConsumer()._report_gate_configuration()
 
-    assert (
-        REGISTRY.get_sample_value(
-            "keep_automation_consumer_gates_config_missing",
-            {"setting": "redis_url"},
-        )
-        == 1
-    )
+    assert gauge("redis_url") == 1
+    assert gauge("redis_client") == 1  # no URL ⇒ no client ⇒ ungated
     assert any("REDIS_URL is not set" in r.getMessage() for r in caplog.records)
 
 
-def test_configured_redis_clears_the_config_gauge(monkeypatch):
+def gauge(setting: str):
+    return REGISTRY.get_sample_value(
+        "keep_automation_consumer_gates_config_missing", {"setting": setting}
+    )
+
+
+def test_an_unbuildable_client_is_reported_as_ungated(monkeypatch, caplog):
+    """URL set but client unbuildable = 100% ungated, and `redis_errors` never
+    increments because nothing is ever attempted. This gauge is the only signal."""
     import src.core.kafka_consumer as kafka_consumer
 
     monkeypatch.setattr(kafka_consumer, "redis_configured", lambda: True)
+    monkeypatch.setattr(kafka_consumer, "get_redis_client", lambda: None)
+    with caplog.at_level(logging.WARNING, logger="src.core.kafka_consumer"):
+        MatchedAlertConsumer()._report_gate_configuration()
+
+    assert gauge("redis_client") == 1
+    assert gauge("redis_url") == 0
+    assert any("could not be built" in r.getMessage() for r in caplog.records)
+
+
+def test_configured_redis_clears_both_config_gauges(monkeypatch):
+    import src.core.kafka_consumer as kafka_consumer
+
+    monkeypatch.setattr(kafka_consumer, "redis_configured", lambda: True)
+    monkeypatch.setattr(kafka_consumer, "get_redis_client", lambda: object())
     MatchedAlertConsumer()._report_gate_configuration()
 
-    assert (
-        REGISTRY.get_sample_value(
-            "keep_automation_consumer_gates_config_missing",
-            {"setting": "redis_url"},
-        )
-        == 0
-    )
+    assert gauge("redis_url") == 0
+    assert gauge("redis_client") == 0
 
 
 def test_error_and_decision_counters_exist_before_the_first_event():
