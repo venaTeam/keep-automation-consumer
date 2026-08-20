@@ -7,7 +7,7 @@ silent". Until D17/D19 expose the endpoint that writes a `suppressed` audit row
 the call site real and the implementation swappable — the same Protocol + stub
 shape `keep-automation-api` uses for `GitClient`.
 
-Only D17's client replaces `get_suppression_auditor()`; no call site changes.
+Only composition-root wiring changes when D17's client replaces the stub.
 """
 
 import logging
@@ -30,7 +30,7 @@ class SuppressionAuditor(Protocol):
         history_id: Optional[str],
         fingerprint: Optional[str],
         reason: str,
-        gate_flags: Optional[dict] = None,
+        gate_flags: Optional[dict[str, str]] = None,
     ) -> None: ...
 
 
@@ -50,7 +50,7 @@ class LoggingSuppressionAuditor:
         history_id: Optional[str],
         fingerprint: Optional[str],
         reason: str,
-        gate_flags: Optional[dict] = None,
+        gate_flags: Optional[dict[str, str]] = None,
     ) -> None:
         logger.info(
             "automations: suppressed run (audit pending D17) tenant_id=%s "
@@ -62,19 +62,3 @@ class LoggingSuppressionAuditor:
             reason,
             gate_flags,
         )
-
-
-_auditor: Optional[SuppressionAuditor] = None
-
-
-def get_suppression_auditor() -> SuppressionAuditor:
-    global _auditor
-    if _auditor is None:
-        _auditor = LoggingSuppressionAuditor()
-    return _auditor
-
-
-def set_suppression_auditor(auditor: Optional[SuppressionAuditor]) -> None:
-    """Swap the implementation (D17's API client; tests)."""
-    global _auditor
-    _auditor = auditor

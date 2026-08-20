@@ -1,12 +1,14 @@
 """C8 skeleton tests: consumer config + matched-message parsing."""
 import json
+import logging
 import signal
 
 import pytest
 from prometheus_client import REGISTRY
 
-from src.core.kafka_consumer import MatchedAlertConsumer, build_consumer_config
+from src.core.kafka_consumer import build_consumer_config
 from src.models.matched_message import MatchedAlertMessage
+from tests.helpers import build_test_consumer
 
 # The canonical matched message, copied from automation-contracts.md
 # section "Matched message". That doc is authoritative — when it changes,
@@ -80,7 +82,7 @@ def test_tenantless_message_is_counted_as_a_deserialize_error():
     errors_before = _counter("keep_automation_consumer_deserialize_errors_total")
     consumed_before = _counter("keep_automation_consumer_messages_consumed_total")
 
-    MatchedAlertConsumer()._handle(_encode(_without("tenant_id")))
+    build_test_consumer()._handle(_encode(_without("tenant_id")))
 
     assert (
         _counter("keep_automation_consumer_deserialize_errors_total")
@@ -119,11 +121,17 @@ class _FakeKafkaConsumer:
         self._on_exhausted = on_exhausted
         self.subscribed = None
         self.closed = False
+        self.paused = False
+        self.pause_count = 0
 
     def subscribe(self, topics):
         self.subscribed = topics
 
     def poll(self, _timeout):
+        if self.paused:
+            if self._messages and self._messages[0].error():
+                return self._messages.pop(0)
+            return None
         if self._messages:
             return self._messages.pop(0)
         self._on_exhausted()
@@ -131,6 +139,16 @@ class _FakeKafkaConsumer:
 
     def close(self):
         self.closed = True
+
+    def assignment(self):
+        return ["partition-0"]
+
+    def pause(self, _partitions):
+        self.paused = True
+        self.pause_count += 1
+
+    def resume(self, _partitions):
+        self.paused = False
 
 
 def _run_loop(consumer, messages, monkeypatch):
@@ -145,10 +163,9 @@ def _run_loop(consumer, messages, monkeypatch):
 
 
 def test_a_raising_handle_does_not_kill_the_poll_loop(monkeypatch):
-    monkeypatch.setattr(MatchedAlertConsumer, "_report_gate_configuration", lambda _: None)
     handled = []
 
-    consumer = MatchedAlertConsumer()
+    consumer = build_test_consumer()
     def explode_on_first(raw):
         handled.append(raw)
         if len(handled) == 1:
@@ -166,22 +183,114 @@ def test_a_raising_handle_does_not_kill_the_poll_loop(monkeypatch):
     )
 
 
-def test_start_reports_the_gate_configuration_before_consuming(monkeypatch):
-    """The unconfigured-Redis warning must land at startup, not on message 1."""
-    consumer = MatchedAlertConsumer()
-    order = []
+def test_poll_loop_dispatches_message_processing_to_worker_pool(monkeypatch):
+    class RecordingWorkerPool:
+        def __init__(self):
+            self.submissions = []
 
-    consumer._report_gate_configuration = lambda: order.append("reported")
-    consumer._handle = lambda raw: order.append("handled")
+        def has_capacity(self):
+            return True
+
+        def try_submit(self, function, *args):
+            self.submissions.append((function, args))
+            return True
+
+        def shutdown(self, *, wait):
+            pass
+
+    pool = RecordingWorkerPool()
+    consumer = build_test_consumer(worker_pool=pool)
 
     _run_loop(consumer, [_FakeMessage(b"first")], monkeypatch)
 
-    assert order == ["reported", "handled"]
+    assert len(pool.submissions) == 1
+    function, args = pool.submissions[0]
+    assert function == consumer._handle_safely
+    assert args == (b"first",)
+
+
+def test_pool_saturation_pauses_but_keeps_polling_until_capacity_returns(monkeypatch):
+    class SaturatedOnceWorkerPool:
+        def __init__(self):
+            self.capacity_checks = 0
+            self.submissions = []
+
+        def has_capacity(self):
+            self.capacity_checks += 1
+            return self.capacity_checks > 1
+
+        def try_submit(self, function, *args):
+            self.submissions.append((function, args))
+            return True
+
+        def shutdown(self, *, wait):
+            pass
+
+    pool = SaturatedOnceWorkerPool()
+    consumer = build_test_consumer(worker_pool=pool)
+
+    fake = _run_loop(consumer, [_FakeMessage(b"first")], monkeypatch)
+
+    assert pool.capacity_checks >= 2
+    assert len(pool.submissions) == 1
+    assert fake.paused is False
+
+
+def test_saturation_reapplies_pause_and_logs_kafka_errors(monkeypatch, caplog):
+    class SaturatedTwiceWorkerPool:
+        def __init__(self):
+            self.capacity_checks = 0
+
+        def has_capacity(self):
+            self.capacity_checks += 1
+            return self.capacity_checks > 2
+
+        def try_submit(self, function, *args):
+            return True
+
+        def shutdown(self, *, wait):
+            pass
+
+    consumer = build_test_consumer(worker_pool=SaturatedTwiceWorkerPool())
+
+    with caplog.at_level(logging.ERROR, logger="src.core.kafka_consumer"):
+        fake = _run_loop(
+            consumer,
+            [_FakeMessage(error="broker went away")],
+            monkeypatch,
+        )
+
+    assert fake.pause_count == 2
+    assert any("broker went away" in record.getMessage() for record in caplog.records)
+
+
+def test_workers_drain_before_kafka_consumer_closes(monkeypatch):
+    events = []
+
+    class OrderedWorkerPool:
+        def has_capacity(self):
+            return True
+
+        def try_submit(self, function, *args):
+            function(*args)
+            return True
+
+        def shutdown(self, *, wait):
+            events.append("workers_drained")
+
+    consumer = build_test_consumer(worker_pool=OrderedWorkerPool())
+    monkeypatch.setattr(signal, "signal", lambda *_: None)
+    fake = _FakeKafkaConsumer([], on_exhausted=consumer.stop)
+    fake.close = lambda: events.append("kafka_closed")
+    consumer._create_consumer = lambda: fake
+
+    consumer.start()
+
+    assert events == ["workers_drained", "kafka_closed"]
 
 
 def test_kafka_errors_are_logged_without_reaching_the_gate(monkeypatch):
-    monkeypatch.setattr(MatchedAlertConsumer, "_report_gate_configuration", lambda _: None)
-    consumer = MatchedAlertConsumer()
+    consumer = build_test_consumer()
     handled = []
     consumer._handle = handled.append
 

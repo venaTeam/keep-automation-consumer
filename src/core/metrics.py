@@ -1,5 +1,20 @@
 """Prometheus metrics for the consumer (skeleton set)."""
+from enum import Enum
+
 from prometheus_client import Counter, Gauge
+
+from src.models.idempotency import IdempotencyOutcome
+
+
+class RedisOperation(str, Enum):
+    CLAIM = "claim"
+    GET = "get"
+    MARK_DONE = "mark_done"
+
+
+class GateConfigSetting(str, Enum):
+    REDIS_URL = "redis_url"
+    REDIS_CLIENT = "redis_client"
 
 messages_consumed = Counter(
     "keep_automation_consumer_messages_consumed_total",
@@ -39,19 +54,38 @@ gates_config_missing = Gauge(
     ["setting"],
 )
 
-# Open the label children up front. `prometheus_client` does not emit a labelled
+# Open and cache label children up front. `prometheus_client` does not emit a labelled
 # child until it is first touched, so an alert written as
 # `rate(redis_errors{operation="claim"}[5m]) > 0` reads "no data" for
 # not-deployed, no-traffic AND misconfigured alike. Pre-initialising makes an
 # absent series mean "not scraped", nothing else.
-for _operation in ("claim", "get", "mark_done"):
-    redis_errors.labels(operation=_operation)
-for _outcome in ("claimed", "duplicate", "ambiguous", "fail_open"):
-    idempotency_decisions.labels(outcome=_outcome)
-for _setting in ("redis_url", "redis_client"):
-    gates_config_missing.labels(setting=_setting)
+redis_error_counters = {
+    operation: redis_errors.labels(operation=operation.value)
+    for operation in RedisOperation
+}
+idempotency_decision_counters = {
+    outcome: idempotency_decisions.labels(outcome=outcome.value)
+    for outcome in IdempotencyOutcome
+}
+gate_config_missing_gauges = {
+    setting: gates_config_missing.labels(setting=setting.value)
+    for setting in GateConfigSetting
+}
 
-# Messages whose processing raised. Today the poll loop logs and moves on, and
+worker_pool_saturated = Gauge(
+    "keep_automation_consumer_worker_pool_saturated",
+    "1 while Kafka partitions are paused because every worker is occupied",
+)
+worker_pool_saturation_events = Counter(
+    "keep_automation_consumer_worker_pool_saturation_events_total",
+    "Transitions into worker-pool saturation",
+)
+worker_pool_tasks_in_flight = Gauge(
+    "keep_automation_consumer_worker_pool_tasks_in_flight",
+    "Per-message tasks currently occupying worker slots",
+)
+
+# Messages whose processing raised. Today the worker guard logs and moves on, and
 # the offset is uncommitted so the message is redelivered — but C11 commits
 # inside that same path, at which point this counter is the only evidence a
 # message was skipped. Added with the guard, not after it.

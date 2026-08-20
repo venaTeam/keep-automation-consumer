@@ -42,9 +42,10 @@ counts every failure; the log doesn't).
 |---|---|---|
 | `REDIS_URL` | *(empty)* | Empty = gates disabled, everything fails open |
 | `IDEMPOTENCY_TTL_SECONDS` | `86400` | The contract value; floored at 1 (`EX 0` is a Redis error) |
-| `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS` / `REDIS_SOCKET_TIMEOUT_SECONDS` | `0.25` | The gate runs inside the poll loop |
+| `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS` / `REDIS_SOCKET_TIMEOUT_SECONDS` | `0.25` | Bounds worker occupancy during Redis failure |
 | `REDIS_BREAKER_FAILURE_THRESHOLD` / `REDIS_BREAKER_OPEN_SECONDS` | `5` / `10.0` | Circuit breaker |
 | `REDIS_ERROR_LOG_INTERVAL_SECONDS` | `30.0` | Traceback budget |
+| `KAFKA_BACKPRESSURE_POLL_TIMEOUT_SECONDS` | `0.1` | Poll cadence while worker saturation pauses partitions |
 
 Metrics — label children are pre-initialised, so an absent series only ever
 means "not scraped":
@@ -53,8 +54,10 @@ means "not scraped":
 |---|---|
 | `..._idempotency_decisions_total{outcome}` | `claimed` / `duplicate` / `ambiguous` / `fail_open`. **Ungated volume is this metric's `fail_open`, not `redis_errors`** — once the breaker is open no Redis call is attempted, so the error counter stops scaling with traffic |
 | `..._redis_errors_total{operation}` | the Redis-down signal (`claim` / `get` / `mark_done`) |
-| `..._gates_config_missing{setting}` | set at startup. `redis_url` = no URL configured; `redis_client` = URL set but the client could not be built (a typo'd scheme or missing driver is 100% ungated and would otherwise increment nothing) |
+| `..._gates_config_missing{setting}` | set at startup. `redis_url` = no URL configured; `redis_client` = URL set but the client could not be built (for example, a typo'd scheme) |
 | `..._handle_errors_total` | messages whose processing raised and were skipped by the poll-loop guard |
+| `..._worker_pool_saturated` / `..._worker_pool_saturation_events_total` | partitions paused because all workers are occupied; Kafka polling continues |
+| `..._worker_pool_tasks_in_flight` | current occupied worker slots |
 
 Suppression audit rows go through `src/bl/suppression_audit.py` — a Protocol
 with a logging stub until D17/D19 expose the endpoint.
@@ -65,7 +68,8 @@ with a logging stub until D17/D19 expose the endpoint.
 |---|---|
 | `src/consumer_main.py` | Standalone entrypoint: metrics server + health server + blocking consume loop. |
 | `src/main.py` | FastAPI health/metrics app (K8s probes / scrape). |
-| `src/core/kafka_consumer.py` | Consumer (auto-commit off) → subscribe → poll → deserialize → log. |
+| `src/core/kafka_consumer.py` | Consumer (auto-commit off) → subscribe → poll → bounded worker dispatch → gate. |
+| `src/core/worker_pool.py` | Nonblocking bounded worker pool; saturation pauses partitions while Kafka polling continues. |
 | `src/config/` | Env config + constants (topic, group, ports, worker-pool size, Redis). |
 | `src/core/redis_client.py` | Process-lifetime Redis client (build once — a per-call pool leaks fds). |
 | `src/models/matched_message.py` | Matched-message shape (contracts §"Matched message"). |

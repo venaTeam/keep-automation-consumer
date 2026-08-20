@@ -4,20 +4,21 @@ Consumes the matched-alerts topic with **auto-commit off**, runs the idempotency
 gate (C9) and logs the decision. Cooldown (C10) and submit + offset commit +
 fail-open (C11) are still absent — the loop never commits offsets yet.
 
-The gate runs inline in the poll loop, which is acceptable only because every
-Redis call is bounded by `REDIS_SOCKET_*_TIMEOUT_SECONDS` and fails open: the
-worst case is a fixed sub-second cost per message, not an unbounded stall
-toward `max.poll.interval.ms`. C11 moves the whole per-message sequence
-(gates → submit → commit) onto the worker pool, where the synchronous submit —
-which blocks for the run's full duration — could never sit inline.
+Per-message work runs in a bounded worker pool. The Kafka poll thread performs
+no Redis or downstream I/O; this preserves polling cadence during gate outages
+without creating an unbounded executor queue.
 """
+from __future__ import annotations
+
 import logging
 import signal
+from typing import TYPE_CHECKING, Optional
 
-from src.bl.gates.idempotency import IdempotencyGate, IdempotencyOutcome
-from src.bl.suppression_audit import REASON_DUPLICATE, get_suppression_auditor
+from src.bl.gates.idempotency import IdempotencyGate
+from src.bl.suppression_audit import REASON_DUPLICATE, SuppressionAuditor
 from src.config.consts import (
     KAFKA_AUTO_OFFSET_RESET,
+    KAFKA_BACKPRESSURE_POLL_TIMEOUT_SECONDS,
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_CONSUMER_GROUP,
     KAFKA_POLL_TIMEOUT_SECONDS,
@@ -25,17 +26,22 @@ from src.config.consts import (
 )
 from src.core.metrics import (
     deserialize_errors,
-    gates_config_missing,
     handle_errors,
     messages_consumed,
+    worker_pool_saturated,
+    worker_pool_saturation_events,
 )
-from src.core.redis_client import get_redis_client, redis_configured
+from src.core.worker_pool import WorkerPool
+from src.models.idempotency import IdempotencyOutcome
 from src.models.matched_message import MatchedAlertMessage
+
+if TYPE_CHECKING:
+    from confluent_kafka import Consumer
 
 logger = logging.getLogger(__name__)
 
 
-def build_consumer_config() -> dict:
+def build_consumer_config() -> dict[str, object]:
     """confluent-kafka consumer config.
 
     `enable.auto.commit=False` is the contract: offsets are committed only after
@@ -50,55 +56,114 @@ def build_consumer_config() -> dict:
 
 
 class MatchedAlertConsumer:
-    def __init__(self, idempotency_gate=None, suppression_auditor=None):
+    def __init__(
+        self,
+        idempotency_gate: IdempotencyGate,
+        suppression_auditor: SuppressionAuditor,
+        worker_pool: WorkerPool,
+    ) -> None:
         self._running = False
-        self._consumer = None
-        self._idempotency_gate = idempotency_gate or IdempotencyGate()
-        self._suppression_auditor = suppression_auditor or get_suppression_auditor()
+        self._consumer: Optional[Consumer] = None
+        self._idempotency_gate = idempotency_gate
+        self._suppression_auditor = suppression_auditor
+        self._worker_pool = worker_pool
 
-    def _create_consumer(self):
+    def _create_consumer(self) -> Consumer:
         # Imported lazily so config/tests don't require a broker or librdkafka.
         from confluent_kafka import Consumer
 
         return Consumer(build_consumer_config())
 
     def start(self) -> None:
-        self._consumer = self._create_consumer()
-        self._consumer.subscribe([MATCHED_ALERTS_TOPIC])
-        self._running = True
-
-        signal.signal(signal.SIGINT, lambda *_: self.stop())
-        signal.signal(signal.SIGTERM, lambda *_: self.stop())
-
-        logger.info(
-            "Consuming topic=%s group=%s (auto-commit OFF)",
-            MATCHED_ALERTS_TOPIC,
-            KAFKA_CONSUMER_GROUP,
-        )
-        self._report_gate_configuration()
+        consumer: Optional[Consumer] = None
+        backpressure_active = False
         try:
+            consumer = self._create_consumer()
+            self._consumer = consumer
+            consumer.subscribe([MATCHED_ALERTS_TOPIC])
+            self._running = True
+
+            signal.signal(signal.SIGINT, lambda *_: self.stop())
+            signal.signal(signal.SIGTERM, lambda *_: self.stop())
+
+            logger.info(
+                "Consuming topic=%s group=%s (auto-commit OFF)",
+                MATCHED_ALERTS_TOPIC,
+                KAFKA_CONSUMER_GROUP,
+            )
             while self._running:
-                msg = self._consumer.poll(KAFKA_POLL_TIMEOUT_SECONDS)
+                if not self._worker_pool.has_capacity():
+                    self._pause_assigned_partitions(consumer)
+                    if not backpressure_active:
+                        self._report_backpressure_started()
+                        backpressure_active = True
+                    # `poll` remains active for callbacks, heartbeats, and
+                    # rebalance progress while assigned partitions are paused.
+                    paused_message = consumer.poll(
+                        KAFKA_BACKPRESSURE_POLL_TIMEOUT_SECONDS
+                    )
+                    if paused_message is not None and paused_message.error():
+                        logger.error("Kafka error: %s", paused_message.error())
+                    elif paused_message is not None:
+                        raise RuntimeError(
+                            "Kafka returned a message while assigned partitions were paused"
+                        )
+                    continue
+
+                if backpressure_active:
+                    self._resume_after_backpressure(consumer)
+                    backpressure_active = False
+
+                msg = consumer.poll(KAFKA_POLL_TIMEOUT_SECONDS)
                 if msg is None:
                     continue
                 if msg.error():
                     logger.error("Kafka error: %s", msg.error())
                     continue
-                try:
-                    self._handle(msg.value())
-                except Exception:  # noqa: BLE001
-                    # One bad message must never kill the loop. Without this,
-                    # an exception escaping `_handle` exits the process, the
-                    # uncommitted offset is redelivered to the restarted pod,
-                    # and the same message poisons it again — a crashloop that
-                    # stalls the whole partition.
-                    handle_errors.inc()
-                    logger.exception(
-                        "Unhandled error processing a matched message; skipping it"
-                    )
+                if not self._worker_pool.try_submit(self._handle_safely, msg.value()):
+                    # Only this poll thread submits work, so capacity cannot be
+                    # consumed between `has_capacity` and `try_submit`. Failing
+                    # here indicates a pool lifecycle bug. Exit with the Kafka
+                    # offset uncommitted rather than drop the message.
+                    raise RuntimeError("worker pool rejected an admitted message")
         finally:
-            self._consumer.close()
-            logger.info("Consumer closed")
+            worker_pool_saturated.set(0)
+            # Future C11 workers commit offsets. Drain them before closing the
+            # Kafka client so shutdown never commits through a closed handle.
+            self._worker_pool.shutdown(wait=True)
+            if consumer is not None:
+                consumer.close()
+                logger.info("Consumer closed")
+
+    @staticmethod
+    def _pause_assigned_partitions(consumer: Consumer) -> None:
+        partitions = consumer.assignment()
+        if partitions:
+            consumer.pause(partitions)
+
+    @staticmethod
+    def _report_backpressure_started() -> None:
+        worker_pool_saturated.set(1)
+        worker_pool_saturation_events.inc()
+        logger.warning(
+            "Worker pool saturated; Kafka partitions paused while polling continues"
+        )
+
+    @staticmethod
+    def _resume_after_backpressure(consumer: Consumer) -> None:
+        partitions = consumer.assignment()
+        if partitions:
+            consumer.resume(partitions)
+        worker_pool_saturated.set(0)
+        logger.info("Worker capacity available; Kafka partitions resumed")
+
+    def _handle_safely(self, raw: bytes) -> None:
+        try:
+            self._handle(raw)
+        except Exception:  # noqa: BLE001
+            # One bad message must not kill a worker or poison its partition.
+            handle_errors.inc()
+            logger.exception("Unhandled error processing a matched message; skipping it")
 
     def _handle(self, raw: bytes) -> None:
         try:
@@ -149,42 +214,6 @@ class MatchedAlertConsumer:
             message.matched_m,
             decision.outcome.value,
         )
-
-    def _report_gate_configuration(self) -> None:
-        """Say once, at startup, whether the gates are configured at all.
-
-        An unset `REDIS_URL` is silent otherwise: every message fails open,
-        `redis_errors` never increments (nothing is attempted), and the pod
-        looks healthy while running 100% ungated. Same signal shape as
-        keep-event-handler's `automation_index_config_missing`.
-        """
-        if not redis_configured():
-            gates_config_missing.labels(setting="redis_url").set(1)
-            gates_config_missing.labels(setting="redis_client").set(1)
-            logger.warning(
-                "automations: REDIS_URL is not set — the idempotency gate is "
-                "disabled and every message will be submitted ungated "
-                "(fail-open). Duplicate protection falls entirely to the API's "
-                "unique (history_id, automation_id) constraint."
-            )
-            return
-
-        gates_config_missing.labels(setting="redis_url").set(0)
-        # A URL alone does not mean the gate is armed: a typo'd scheme or a
-        # missing driver produces an unbuildable client that fails open on
-        # every message *without* incrementing `redis_errors` (nothing is ever
-        # attempted). Building it here moves that failure — and its traceback —
-        # to startup, where operators look, and keeps the gauge honest instead
-        # of reporting "armed" for a permanently ungated consumer.
-        if get_redis_client() is None:
-            gates_config_missing.labels(setting="redis_client").set(1)
-            logger.warning(
-                "automations: REDIS_URL is set but the Redis client could not "
-                "be built — the idempotency gate is disabled for the life of "
-                "this process (fail-open). Fix the configuration and restart."
-            )
-            return
-        gates_config_missing.labels(setting="redis_client").set(0)
 
     def stop(self) -> None:
         self._running = False

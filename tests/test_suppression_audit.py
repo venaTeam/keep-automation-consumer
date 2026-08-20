@@ -9,13 +9,10 @@ catch a signature drift — the real implementation has to be called.
 import inspect
 import logging
 
-from src.bl import suppression_audit
 from src.bl.suppression_audit import (
     REASON_COOLDOWN,
     REASON_DUPLICATE,
     LoggingSuppressionAuditor,
-    get_suppression_auditor,
-    set_suppression_auditor,
 )
 
 # The exact keyword set `MatchedAlertConsumer._handle` passes.
@@ -63,30 +60,8 @@ def test_reason_tokens_match_the_db_enum():
     assert REASON_COOLDOWN == "cooldown"
 
 
-def test_default_auditor_is_a_shared_logging_stub():
-    set_suppression_auditor(None)
-    try:
-        first = get_suppression_auditor()
+def test_logging_auditor_has_no_hidden_global_instance():
+    first = LoggingSuppressionAuditor()
+    second = LoggingSuppressionAuditor()
 
-        assert isinstance(first, LoggingSuppressionAuditor)
-        assert get_suppression_auditor() is first
-    finally:
-        set_suppression_auditor(None)
-
-
-def test_the_implementation_is_swappable():
-    class Spy:
-        def __init__(self):
-            self.rows = []
-
-        def record_suppression(self, **row):
-            self.rows.append(row)
-
-    spy = Spy()
-    set_suppression_auditor(spy)
-    try:
-        assert get_suppression_auditor() is spy
-    finally:
-        set_suppression_auditor(None)
-
-    assert suppression_audit._auditor is None
+    assert first is not second

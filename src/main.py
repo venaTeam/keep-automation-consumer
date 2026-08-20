@@ -5,14 +5,12 @@ exposes health + metrics.
 """
 import logging
 
-from dotenv import find_dotenv, load_dotenv
 from fastapi import FastAPI
 
 from src import logging_conf
 from src.api.routes.v1 import health, metrics
 from src.core import metrics as _consumer_metrics  # noqa: F401  (register counters for scrape)
 
-load_dotenv(find_dotenv())
 logging_conf.setup_logging()
 logger = logging.getLogger(__name__)
 

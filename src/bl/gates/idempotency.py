@@ -33,10 +33,10 @@ message's latency but not the loop's throughput.
 """
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional
+from typing import Any, Callable, Optional, Protocol
 
 from src.config.consts import (
     IDEMPOTENCY_TTL_SECONDS,
@@ -44,8 +44,12 @@ from src.config.consts import (
     REDIS_BREAKER_OPEN_SECONDS,
     REDIS_ERROR_LOG_INTERVAL_SECONDS,
 )
-from src.core.metrics import idempotency_decisions, redis_errors
-from src.core.redis_client import get_redis_client
+from src.core.metrics import (
+    RedisOperation,
+    idempotency_decision_counters,
+    redis_error_counters,
+)
+from src.models.idempotency import IdempotencyOutcome
 from src.models.matched_message import MatchedAlertMessage
 
 logger = logging.getLogger(__name__)
@@ -56,20 +60,31 @@ VALUE_DONE = "done"
 
 # Reason token recorded on a fail-open submit (spec §6.3, C11's `gate_flags`).
 REASON_REDIS_UNAVAILABLE = "redis_unavailable"
+REASON_MISSING_HISTORY_ID = "missing_history_id"
 
 
-class IdempotencyOutcome(str, Enum):
-    CLAIMED = "claimed"
-    DUPLICATE = "duplicate"
-    AMBIGUOUS = "ambiguous"
-    FAIL_OPEN = "fail_open"
+class RedisGateClient(Protocol):
+    def set(
+        self,
+        key: str,
+        value: str,
+        *,
+        nx: bool = False,
+        ex: Optional[int] = None,
+    ) -> Any: ...
+
+    def get(self, key: str) -> Any: ...
+
+
+RedisClientFactory = Callable[[], Optional[RedisGateClient]]
+Clock = Callable[[], float]
 
 
 @dataclass(frozen=True)
 class IdempotencyDecision:
     outcome: IdempotencyOutcome
     key: str
-    gate_flags: dict = field(default_factory=dict)
+    gate_flags: dict[str, str] = field(default_factory=dict)
 
     @property
     def should_submit(self) -> bool:
@@ -88,60 +103,80 @@ def idempotency_key(history_id: str, automation_id: str) -> str:
 
 
 class IdempotencyGate:
-    def __init__(self, client_factory=get_redis_client, clock=time.monotonic):
+    def __init__(
+        self,
+        client_factory: RedisClientFactory,
+        clock: Clock = time.monotonic,
+    ) -> None:
         self._client_factory = client_factory
         self._clock = clock
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
+        self._half_open_probe_in_flight = False
         self._next_error_log_at = 0.0
+        self._breaker_lock = threading.Lock()
 
     # -- circuit breaker ---------------------------------------------------
     #
-    # Deliberately lock-free. Under the C11 worker pool several threads race on
-    # these two attributes, and the worst outcome of a lost update is one extra
-    # probe or one extra skipped call — the gate is advisory either way, so a
-    # lock on the hot path would cost more than the race.
+    # State changes are synchronized because one gate is shared by all workers.
+    # Healthy calls do not hold the lock during Redis I/O. An initial outage can
+    # therefore have at most the already-running worker count in flight; once
+    # open, only one half-open probe is admitted per window.
 
-    @property
-    def _breaker_is_open(self) -> bool:
-        return self._clock() < self._breaker_open_until
+    def _breaker_allows_call(self) -> bool:
+        now = self._clock()
+        with self._breaker_lock:
+            if now < self._breaker_open_until:
+                return False
+            if self._breaker_open_until:
+                if self._half_open_probe_in_flight:
+                    return False
+                self._half_open_probe_in_flight = True
+            return True
 
     def _record_success(self) -> None:
-        self._consecutive_failures = 0
-        self._breaker_open_until = 0.0
+        with self._breaker_lock:
+            self._consecutive_failures = 0
+            self._breaker_open_until = 0.0
+            self._half_open_probe_in_flight = False
 
     def _record_failure(self) -> None:
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= REDIS_BREAKER_FAILURE_THRESHOLD:
-            self._breaker_open_until = self._clock() + REDIS_BREAKER_OPEN_SECONDS
-            # Half-open: park the counter one short of the threshold, so the
-            # first message after the window probes Redis for real and a single
-            # failed probe re-opens immediately. Resetting to 0 here instead
-            # would charge THRESHOLD timeouts per window for the whole outage —
-            # 5x the documented cost — while a success still zeroes the counter
-            # via `_record_success`, so a recovered Redis is not penalised.
-            self._consecutive_failures = REDIS_BREAKER_FAILURE_THRESHOLD - 1
+        with self._breaker_lock:
+            self._consecutive_failures += 1
+            self._half_open_probe_in_flight = False
+            if self._consecutive_failures >= REDIS_BREAKER_FAILURE_THRESHOLD:
+                self._breaker_open_until = self._clock() + REDIS_BREAKER_OPEN_SECONDS
+                # Half-open: park one short of threshold, so one failed probe
+                # re-opens immediately while one success resets the run.
+                self._consecutive_failures = REDIS_BREAKER_FAILURE_THRESHOLD - 1
 
-    def _log_redis_error(self, operation: str, key: str) -> None:
+    def _log_redis_error(self, operation: RedisOperation, key: str) -> None:
         """Budgeted traceback: the metric counts every failure, the log doesn't.
 
-        A Redis outage at ~200 msg/s writes 200 stack traces/s synchronously
-        from inside the poll loop otherwise — the noise itself becomes the
+        A Redis outage at ~200 msg/s writes 200 stack traces/s from the worker
+        pool otherwise — the noise itself becomes the
         outage. Same reasoning keep-event-handler's pubsub listener applies to
         its reconnect loop.
         """
         now = self._clock()
-        if now >= self._next_error_log_at:
-            self._next_error_log_at = now + REDIS_ERROR_LOG_INTERVAL_SECONDS
+        with self._breaker_lock:
+            should_log = now >= self._next_error_log_at
+            if should_log:
+                self._next_error_log_at = now + REDIS_ERROR_LOG_INTERVAL_SECONDS
+        if should_log:
             logger.exception(
                 "automations: idempotency %s failed for key=%s; failing open "
                 "(further tracebacks suppressed for %ss)",
-                operation,
+                operation.value,
                 key,
                 REDIS_ERROR_LOG_INTERVAL_SECONDS,
             )
         else:
-            logger.debug("automations: idempotency %s failed for key=%s", operation, key)
+            logger.debug(
+                "automations: idempotency %s failed for key=%s",
+                operation.value,
+                key,
+            )
 
     def claim(self, message: MatchedAlertMessage) -> IdempotencyDecision:
         history_id = message.history_id
@@ -160,11 +195,11 @@ class IdempotencyGate:
                 message.automation_id,
                 message.tenant_id,
             )
-            return self._decide(IdempotencyOutcome.FAIL_OPEN, key, "missing_history_id")
+            return self._decide(
+                IdempotencyOutcome.FAIL_OPEN, key, REASON_MISSING_HISTORY_ID
+            )
 
-        if self._breaker_is_open:
-            # Redis is known-sick; skip the socket entirely rather than pay a
-            # timeout per message. Counted as fail-open, not as a new error.
+        if not self._breaker_allows_call():
             return self._decide(
                 IdempotencyOutcome.FAIL_OPEN, key, REASON_REDIS_UNAVAILABLE
             )
@@ -176,6 +211,7 @@ class IdempotencyGate:
             # contract — an injected factory (C11, tests) may raise.
             client = self._client_factory()
             if client is None:
+                self._record_failure()
                 return self._decide(
                     IdempotencyOutcome.FAIL_OPEN, key, REASON_REDIS_UNAVAILABLE
                 )
@@ -183,15 +219,15 @@ class IdempotencyGate:
                 key, VALUE_PENDING, nx=True, ex=IDEMPOTENCY_TTL_SECONDS
             )
         except Exception:  # noqa: BLE001 - a gate never fails the message
-            redis_errors.labels(operation="claim").inc()
+            redis_error_counters[RedisOperation.CLAIM].inc()
             self._record_failure()
-            self._log_redis_error("claim", key)
+            self._log_redis_error(RedisOperation.CLAIM, key)
             return self._decide(
                 IdempotencyOutcome.FAIL_OPEN, key, REASON_REDIS_UNAVAILABLE
             )
 
-        self._record_success()
         if claimed:
+            self._record_success()
             return self._decide(IdempotencyOutcome.CLAIMED, key)
 
         # NX lost the race with an earlier delivery of this same event; the
@@ -201,13 +237,14 @@ class IdempotencyGate:
         try:
             value = client.get(key)
         except Exception:  # noqa: BLE001
-            redis_errors.labels(operation="get").inc()
+            redis_error_counters[RedisOperation.GET].inc()
             self._record_failure()
-            self._log_redis_error("read", key)
+            self._log_redis_error(RedisOperation.GET, key)
             return self._decide(
                 IdempotencyOutcome.FAIL_OPEN, key, REASON_REDIS_UNAVAILABLE
             )
 
+        self._record_success()
         value = _as_text(value)
         if value == VALUE_DONE:
             return self._decide(IdempotencyOutcome.DUPLICATE, key)
@@ -226,19 +263,22 @@ class IdempotencyGate:
         in Postgres, and a lost `done` costs one extra idempotent submit.
         """
         history_id = message.history_id
-        if not history_id or self._breaker_is_open:
+        if not history_id:
             return False
 
         key = idempotency_key(history_id, message.automation_id)
+        if not self._breaker_allows_call():
+            return False
         try:
             client = self._client_factory()
             if client is None:
+                self._record_failure()
                 return False
             client.set(key, VALUE_DONE, ex=IDEMPOTENCY_TTL_SECONDS)
         except Exception:  # noqa: BLE001
-            redis_errors.labels(operation="mark_done").inc()
+            redis_error_counters[RedisOperation.MARK_DONE].inc()
             self._record_failure()
-            self._log_redis_error("mark_done", key)
+            self._log_redis_error(RedisOperation.MARK_DONE, key)
             # A redelivery will re-submit and the DB constraint will absorb it.
             return False
 
@@ -249,15 +289,17 @@ class IdempotencyGate:
     def _decide(
         outcome: IdempotencyOutcome, key: str, reason: Optional[str] = None
     ) -> IdempotencyDecision:
-        idempotency_decisions.labels(outcome=outcome.value).inc()
+        idempotency_decision_counters[outcome].inc()
         flags = {"idempotency": "skipped" if reason else outcome.value}
         if reason:
             flags["reason"] = reason
         return IdempotencyDecision(outcome=outcome, key=key, gate_flags=flags)
 
 
-def _as_text(value) -> Optional[str]:
+def _as_text(value: Any) -> Optional[str]:
     """Tolerate a client built without `decode_responses` (tests, reuse)."""
     if isinstance(value, bytes):
         return value.decode("utf-8", "replace")
-    return value
+    if value is None or isinstance(value, str):
+        return value
+    return str(value)

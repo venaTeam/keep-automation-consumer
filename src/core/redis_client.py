@@ -9,17 +9,20 @@ the same build-once shape. Reuse the client; the pool underneath reconnects.
 
 **Absent Redis is a supported state.** `REDIS_URL` unset returns `None`, and the
 gates treat `None` exactly like an unreachable Redis: fail open (spec §4.5,
-§6.3). Nothing here raises on the hot path — including a missing `redis` wheel,
-which degrades to ungated submits rather than a crashlooping consumer.
+§6.3). The declared `redis` package is imported at startup; a broken deployment
+must fail fast rather than look healthy while silently running ungated.
 
 **A failed build is cached.** Construction failures are configuration failures
-(bad URL, missing driver), not transient ones. Retrying per message would
+(bad URL or unsupported scheme), not transient ones. Retrying per message would
 re-lock, re-import and re-log a traceback for every message at the ~200 msg/s
 target. `reset_redis_client()` clears the failure for a re-read of config.
 """
 
 import logging
 import threading
+from typing import Optional
+
+import redis
 
 from src.config.consts import (
     REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
@@ -34,7 +37,7 @@ logger = logging.getLogger(__name__)
 # the connection silently otherwise.
 _HEALTH_CHECK_INTERVAL_SECONDS = 30
 
-_client = None
+_client: Optional[redis.Redis] = None
 _build_failed = False
 _lock = threading.Lock()
 
@@ -50,7 +53,7 @@ def redis_configured() -> bool:
     return bool(REDIS_URL)
 
 
-def get_redis_client():
+def get_redis_client() -> Optional[redis.Redis]:
     """The shared client, or `None` when Redis is unconfigured or unbuildable.
 
     `None` is not an error path for callers — the gates fail open on it, which
@@ -73,13 +76,8 @@ def get_redis_client():
     return _client
 
 
-def _build_client():
+def _build_client() -> Optional[redis.Redis]:
     try:
-        # Imported here, inside the try, so a missing `redis` wheel degrades to
-        # "gates fail open" instead of taking the consumer process down. The
-        # import is deliberately not at module scope for the same reason.
-        import redis
-
         return redis.Redis.from_url(
             REDIS_URL,
             # Gate values are short ASCII tokens ("pending"/"done") compared as

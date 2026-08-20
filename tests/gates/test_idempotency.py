@@ -12,6 +12,8 @@ Redis is faked in-process: these are contract tests, not a driver integration.
 
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from prometheus_client import REGISTRY
@@ -28,8 +30,9 @@ from src.config.consts import (
     REDIS_BREAKER_OPEN_SECONDS,
     REDIS_ERROR_LOG_INTERVAL_SECONDS,
 )
-from src.core.kafka_consumer import MatchedAlertConsumer
+from src.core.metrics import GateConfigSetting, RedisOperation
 from src.models.matched_message import MatchedAlertMessage
+from tests.helpers import build_test_consumer
 
 AUTOMATION_ID = "3f2b8c1e-4d6a-4b2f-9e77-0a1b2c3d4e5f"
 HISTORY_ID = "evt-789"
@@ -355,16 +358,19 @@ def test_every_decision_is_counted_by_outcome():
 # -- redelivery through the consume loop --------------------------------------
 
 
-def test_redelivery_of_the_same_event_yields_one_submit_and_one_suppression():
+def test_each_duplicate_redelivery_is_suppressed_and_audited():
     """The C9 half of the story's integration check.
 
     Delivery 1 claims and (once C11 lands) submits; `mark_done` stands in for
-    the API-confirmed submit. Delivery 2 is suppressed and audited exactly once.
+    the API-confirmed submit. Both later redeliveries are suppressed and audited.
     """
     redis = FakeRedis()
     gate = gate_with(redis)
     auditor = RecordingAuditor()
-    consumer = MatchedAlertConsumer(idempotency_gate=gate, suppression_auditor=auditor)
+    consumer = build_test_consumer(
+        idempotency_gate=gate,
+        suppression_auditor=auditor,
+    )
     raw = json.dumps(MESSAGE).encode("utf-8")
 
     consumer._handle(raw)
@@ -388,15 +394,27 @@ def test_a_failing_client_factory_does_not_escape_handle():
     def angry_factory():
         raise RuntimeError("client construction blew up")
 
-    consumer = MatchedAlertConsumer(
+    consumer = build_test_consumer(
         idempotency_gate=IdempotencyGate(client_factory=angry_factory),
         suppression_auditor=RecordingAuditor(),
+    )
+    before = counter(
+        "keep_automation_consumer_idempotency_decisions_total",
+        outcome=IdempotencyOutcome.FAIL_OPEN.value,
     )
 
     consumer._handle(json.dumps(MESSAGE).encode("utf-8"))  # must not raise
 
+    assert (
+        counter(
+            "keep_automation_consumer_idempotency_decisions_total",
+            outcome=IdempotencyOutcome.FAIL_OPEN.value,
+        )
+        == before + 1
+    )
 
-def test_a_failing_auditor_does_not_escape_handle():
+
+def test_a_failing_auditor_does_not_escape_handle(caplog):
     """D17 swaps the stub for an HTTP client that will raise on a 503.
 
     An exception here would exit the process, the uncommitted offset would be
@@ -410,11 +428,14 @@ def test_a_failing_auditor_does_not_escape_handle():
 
     redis = FakeRedis()
     redis.values[idempotency_key(HISTORY_ID, AUTOMATION_ID)] = "done"
-    consumer = MatchedAlertConsumer(
+    consumer = build_test_consumer(
         idempotency_gate=gate_with(redis), suppression_auditor=AngryAuditor()
     )
 
-    consumer._handle(json.dumps(MESSAGE).encode("utf-8"))  # must not raise
+    with caplog.at_level(logging.ERROR, logger="src.core.kafka_consumer"):
+        consumer._handle(json.dumps(MESSAGE).encode("utf-8"))  # must not raise
+
+    assert "could not audit a suppressed duplicate" in caplog.records[-1].getMessage()
 
 
 # -- circuit breaker ----------------------------------------------------------
@@ -449,6 +470,40 @@ def test_breaker_opens_after_repeated_failures_and_stops_touching_redis():
         assert gate.claim(message()).outcome is IdempotencyOutcome.FAIL_OPEN
 
     assert redis.calls[calls_before:] == []  # not one socket touched
+
+
+def test_repeated_get_failures_open_the_breaker():
+    """A successful NX miss must not erase a failure from the following GET."""
+    clock = Clock()
+    redis = FakeRedis(fail_on=["get"])
+    redis.values[idempotency_key(HISTORY_ID, AUTOMATION_ID)] = "pending"
+    gate = IdempotencyGate(client_factory=lambda: redis, clock=clock)
+
+    for _ in range(REDIS_BREAKER_FAILURE_THRESHOLD):
+        assert gate.claim(message()).outcome is IdempotencyOutcome.FAIL_OPEN
+
+    calls_before = len(redis.calls)
+    assert gate.claim(message()).outcome is IdempotencyOutcome.FAIL_OPEN
+
+    assert redis.calls[calls_before:] == []
+
+
+def test_breaker_stops_calling_a_raising_client_factory():
+    clock = Clock()
+    calls = []
+
+    def angry_factory():
+        calls.append(True)
+        raise RuntimeError("client construction blew up")
+
+    gate = IdempotencyGate(client_factory=angry_factory, clock=clock)
+    for _ in range(REDIS_BREAKER_FAILURE_THRESHOLD):
+        gate.claim(message())
+
+    calls_before = len(calls)
+    gate.claim(message())
+
+    assert len(calls) == calls_before
 
 
 def test_breaker_half_opens_after_the_window_and_recovers():
@@ -517,6 +572,31 @@ def test_redis_errors_are_logged_once_per_budget_window(caplog):
     assert len(caplog.records) == 2
 
 
+def test_concurrent_redis_errors_share_one_log_budget(caplog):
+    worker_count = 8
+    barrier = threading.Barrier(worker_count)
+
+    class SimultaneouslyFailingRedis(FakeRedis):
+        def set(self, key, value, nx=False, ex=None):
+            self.calls.append(("set", key, value, nx, ex))
+            barrier.wait(timeout=2)
+            raise ConnectionError("redis down")
+
+    gate = IdempotencyGate(
+        client_factory=lambda: SimultaneouslyFailingRedis(),
+        clock=Clock(),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="src.bl.gates.idempotency"):
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            decisions = list(executor.map(lambda _: gate.claim(message()), range(worker_count)))
+
+    assert all(
+        decision.outcome is IdempotencyOutcome.FAIL_OPEN for decision in decisions
+    )
+    assert len(caplog.records) == 1
+
+
 def test_mark_done_is_skipped_while_the_breaker_is_open():
     clock = Clock()
     gate, redis = failing_gate(clock)
@@ -533,14 +613,14 @@ def test_mark_done_is_skipped_while_the_breaker_is_open():
 
 
 def test_unconfigured_redis_raises_the_config_gauge_and_warns(monkeypatch, caplog):
-    import src.core.kafka_consumer as kafka_consumer
+    import src.consumer_main as consumer_main
 
-    monkeypatch.setattr(kafka_consumer, "redis_configured", lambda: False)
-    with caplog.at_level(logging.WARNING, logger="src.core.kafka_consumer"):
-        MatchedAlertConsumer()._report_gate_configuration()
+    monkeypatch.setattr(consumer_main, "redis_configured", lambda: False)
+    with caplog.at_level(logging.WARNING, logger="src.consumer_main"):
+        assert consumer_main.configure_redis() is None
 
-    assert gauge("redis_url") == 1
-    assert gauge("redis_client") == 1  # no URL ⇒ no client ⇒ ungated
+    assert gauge(GateConfigSetting.REDIS_URL.value) == 1
+    assert gauge(GateConfigSetting.REDIS_CLIENT.value) == 1
     assert any("REDIS_URL is not set" in r.getMessage() for r in caplog.records)
 
 
@@ -553,44 +633,45 @@ def gauge(setting: str):
 def test_an_unbuildable_client_is_reported_as_ungated(monkeypatch, caplog):
     """URL set but client unbuildable = 100% ungated, and `redis_errors` never
     increments because nothing is ever attempted. This gauge is the only signal."""
-    import src.core.kafka_consumer as kafka_consumer
+    import src.consumer_main as consumer_main
 
-    monkeypatch.setattr(kafka_consumer, "redis_configured", lambda: True)
-    monkeypatch.setattr(kafka_consumer, "get_redis_client", lambda: None)
-    with caplog.at_level(logging.WARNING, logger="src.core.kafka_consumer"):
-        MatchedAlertConsumer()._report_gate_configuration()
+    monkeypatch.setattr(consumer_main, "redis_configured", lambda: True)
+    monkeypatch.setattr(consumer_main, "get_redis_client", lambda: None)
+    with caplog.at_level(logging.WARNING, logger="src.consumer_main"):
+        assert consumer_main.configure_redis() is None
 
-    assert gauge("redis_client") == 1
-    assert gauge("redis_url") == 0
+    assert gauge(GateConfigSetting.REDIS_CLIENT.value) == 1
+    assert gauge(GateConfigSetting.REDIS_URL.value) == 0
     assert any("could not be built" in r.getMessage() for r in caplog.records)
 
 
 def test_configured_redis_clears_both_config_gauges(monkeypatch):
-    import src.core.kafka_consumer as kafka_consumer
+    import src.consumer_main as consumer_main
 
-    monkeypatch.setattr(kafka_consumer, "redis_configured", lambda: True)
-    monkeypatch.setattr(kafka_consumer, "get_redis_client", lambda: object())
-    MatchedAlertConsumer()._report_gate_configuration()
+    client = object()
+    monkeypatch.setattr(consumer_main, "redis_configured", lambda: True)
+    monkeypatch.setattr(consumer_main, "get_redis_client", lambda: client)
 
-    assert gauge("redis_url") == 0
-    assert gauge("redis_client") == 0
+    assert consumer_main.configure_redis() is client
+    assert gauge(GateConfigSetting.REDIS_URL.value) == 0
+    assert gauge(GateConfigSetting.REDIS_CLIENT.value) == 0
 
 
 def test_error_and_decision_counters_exist_before_the_first_event():
     """An alert on an absent series cannot distinguish "healthy" from "not deployed"."""
-    for operation in ("claim", "get", "mark_done"):
+    for operation in RedisOperation:
         assert (
             REGISTRY.get_sample_value(
                 "keep_automation_consumer_redis_errors_total",
-                {"operation": operation},
+                {"operation": operation.value},
             )
             is not None
         )
-    for outcome in ("claimed", "duplicate", "ambiguous", "fail_open"):
+    for outcome in IdempotencyOutcome:
         assert (
             REGISTRY.get_sample_value(
                 "keep_automation_consumer_idempotency_decisions_total",
-                {"outcome": outcome},
+                {"outcome": outcome.value},
             )
             is not None
         )
@@ -600,7 +681,7 @@ def test_a_pending_sibling_does_not_suppress_the_redelivery():
     """A crash between claim and submit must not lose the automation."""
     redis = FakeRedis()
     auditor = RecordingAuditor()
-    consumer = MatchedAlertConsumer(
+    consumer = build_test_consumer(
         idempotency_gate=gate_with(redis), suppression_auditor=auditor
     )
     raw = json.dumps(MESSAGE).encode("utf-8")

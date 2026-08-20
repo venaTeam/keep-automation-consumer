@@ -7,10 +7,13 @@ MATCHED_ALERTS_TOPIC = config("MATCHED_ALERTS_TOPIC", default="matched-alerts")
 KAFKA_CONSUMER_GROUP = config("KAFKA_CONSUMER_GROUP", default="keep-automation-consumer")
 KAFKA_AUTO_OFFSET_RESET = config("KAFKA_AUTO_OFFSET_RESET", default="earliest")
 KAFKA_POLL_TIMEOUT_SECONDS = config("KAFKA_POLL_TIMEOUT_SECONDS", default="1.0", cast=float)
+KAFKA_BACKPRESSURE_POLL_TIMEOUT_SECONDS = config(
+    "KAFKA_BACKPRESSURE_POLL_TIMEOUT_SECONDS", default="0.1", cast=float
+)
 
 # Worker pool sized toward ~200 submits/s (spec §2.3). Config knob only in the
 # skeleton — the pool itself arrives with submit orchestration (C11).
-WORKER_POOL_SIZE = config("WORKER_POOL_SIZE", default="200", cast=int)
+WORKER_POOL_SIZE = max(1, config("WORKER_POOL_SIZE", default="200", cast=int))
 
 # Ports (event-handler convention: health 8092, metrics 8094).
 HEALTH_CHECK_PORT = config("HEALTH_CHECK_PORT", default="8092", cast=int)
@@ -61,7 +64,7 @@ REDIS_BREAKER_OPEN_SECONDS = max(
 )
 
 # Traceback budget for the gate's Redis errors: a Redis outage at 200 msg/s
-# would otherwise write 200 stack traces/s synchronously from the poll loop.
+# would otherwise write 200 stack traces/s from the worker pool.
 # The metric counts every failure; only the logging is budgeted.
 REDIS_ERROR_LOG_INTERVAL_SECONDS = max(
     0.0, config("REDIS_ERROR_LOG_INTERVAL_SECONDS", default="30.0", cast=float)
