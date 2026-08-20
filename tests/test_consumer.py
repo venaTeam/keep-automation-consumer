@@ -6,6 +6,7 @@ import signal
 import pytest
 from prometheus_client import REGISTRY
 
+from src.bl.gates.cooldown import CooldownGate
 from src.core.kafka_consumer import build_consumer_config
 from src.models.matched_message import MatchedAlertMessage
 from tests.helpers import build_test_consumer
@@ -91,6 +92,19 @@ def test_tenantless_message_is_counted_as_a_deserialize_error():
     assert (
         _counter("keep_automation_consumer_messages_consumed_total") == consumed_before
     )
+
+
+def test_c10_cooldown_gate_remains_dark(monkeypatch):
+    """C11, not C10, owns runtime gate composition and offset semantics."""
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("C10 must remain unwired until C11")
+
+    monkeypatch.setattr(CooldownGate, "claim", fail_if_called)
+
+    # The canonical message carries cooldown config. Processing it today must
+    # still stop after the already-wired C9 decision without touching C10.
+    build_test_consumer()._handle(_encode(CANONICAL_MESSAGE))
 
 
 # -- poll loop resilience -----------------------------------------------------
