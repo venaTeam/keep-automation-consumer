@@ -8,14 +8,31 @@ import logging
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Optional
 
-from dotenv import find_dotenv, load_dotenv
 from prometheus_client import start_http_server
+from redis import Redis
 
 from src import logging_conf
-from src.config.consts import HEALTH_CHECK_PORT, PROMETHEUS_METRICS_PORT
+from src.bl.gates.idempotency import IdempotencyGate
+from src.bl.suppression_audit import LoggingSuppressionAuditor
+from src.config.consts import (
+    HEALTH_CHECK_PORT,
+    PROMETHEUS_METRICS_PORT,
+    WORKER_POOL_SIZE,
+)
+from src.core.kafka_consumer import MatchedAlertConsumer
+from src.core.metrics import (
+    GateConfigSetting,
+    gate_config_missing_gauges,
+)
+from src.core.redis_client import (
+    get_redis_client,
+    redis_configured,
+    reset_redis_client,
+)
+from src.core.worker_pool import BoundedWorkerPool
 
-load_dotenv(find_dotenv())
 logging_conf.setup_logging()
 logger = logging.getLogger(__name__)
 
@@ -46,20 +63,59 @@ def create_health_server(port: int) -> HTTPServer:
     return server
 
 
+def configure_redis() -> Optional[Redis]:
+    """Build and report process Redis state before message consumption."""
+    redis_url_gauge = gate_config_missing_gauges[GateConfigSetting.REDIS_URL]
+    redis_client_gauge = gate_config_missing_gauges[GateConfigSetting.REDIS_CLIENT]
+
+    if not redis_configured():
+        redis_url_gauge.set(1)
+        redis_client_gauge.set(1)
+        logger.warning(
+            "automations: REDIS_URL is not set — the idempotency gate is "
+            "disabled and every message will be submitted ungated (fail-open). "
+            "Duplicate protection falls entirely to the API's unique "
+            "(history_id, automation_id) constraint."
+        )
+        return None
+
+    redis_url_gauge.set(0)
+    client = get_redis_client()
+    if client is None:
+        redis_client_gauge.set(1)
+        logger.warning(
+            "automations: REDIS_URL is set but the Redis client could not be "
+            "built — the idempotency gate is disabled for the life of this "
+            "process (fail-open). Fix the configuration and restart."
+        )
+        return None
+
+    redis_client_gauge.set(0)
+    return client
+
+
 def main() -> None:
     logger.info("Starting Keep Automation Consumer (matched-alerts)")
     try:
         start_metrics_server(PROMETHEUS_METRICS_PORT)
         create_health_server(HEALTH_CHECK_PORT)
-
-        from src.core.kafka_consumer import MatchedAlertConsumer
-
-        MatchedAlertConsumer().start()  # blocks until shutdown
+        redis_client = configure_redis()
+        worker_pool = BoundedWorkerPool(WORKER_POOL_SIZE)
+        consumer = MatchedAlertConsumer(
+            idempotency_gate=IdempotencyGate(
+                client_factory=lambda: redis_client,
+            ),
+            suppression_auditor=LoggingSuppressionAuditor(),
+            worker_pool=worker_pool,
+        )
+        consumer.start()  # blocks until shutdown
     except KeyboardInterrupt:
         logger.info("Interrupted, shutting down")
     except Exception as exc:
         logger.exception("Fatal error: %s", exc)
         sys.exit(1)
+    finally:
+        reset_redis_client()
     logger.info("Consumer shutdown complete")
 
 
