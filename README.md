@@ -53,8 +53,11 @@ without a key and carry a warning; an empty field list creates a
 whole-automation key. Losing NX suppresses without refreshing the winner's TTL.
 
 The claim value is an ownership token. `activate()` uses Lua to compare the
-stored value with `run_id` before extending to full `cooldown_seconds`;
-`release()` compares before deleting. A stale delivery therefore cannot mutate
+stored value with `run_id` and, on match, atomically rotate it to `done` while
+extending to full `cooldown_seconds` — arming retires the token, so an armed
+claim can no longer be extended or deleted by anyone (a misplaced `release()`
+cannot drop a live cooldown). `release()` compares before deleting a still-
+provisional claim. A stale delivery therefore cannot mutate
 a replacement claim. The exact 30-second provisional TTL covers the future
 C11 submit/accept round trip; there is no watchdog. C11 will call `activate`
 only for `200 accepted` and `release` for failures, 429s, and other 200 statuses.

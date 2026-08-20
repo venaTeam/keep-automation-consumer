@@ -1,6 +1,7 @@
 """Consumer-side copies of contracts pinned by automation-contracts.md."""
 
 from src.contracts.cooldown import (
+    COOLDOWN_ARMED_VALUE,
     COOLDOWN_PROVISIONAL_TTL_SECONDS,
     COOLDOWN_SCHEME_VER,
     MissingCooldownField,
@@ -10,6 +11,7 @@ from src.contracts.cooldown import (
 )
 
 __all__ = [
+    "COOLDOWN_ARMED_VALUE",
     "COOLDOWN_PROVISIONAL_TTL_SECONDS",
     "COOLDOWN_SCHEME_VER",
     "MissingCooldownField",

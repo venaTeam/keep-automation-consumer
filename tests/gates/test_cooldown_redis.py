@@ -13,6 +13,7 @@ import pytest
 from redis import Redis
 
 from src.bl.gates.cooldown import CooldownGate
+from src.contracts.cooldown import COOLDOWN_ARMED_VALUE
 from src.models.cooldown import CooldownOutcome
 from src.models.matched_message import MatchedAlertMessage
 
@@ -103,7 +104,14 @@ def test_compare_and_extend_requires_current_owner(redis_client):
     remember(decision.key)
 
     assert gate.activate(decision) is True
-    assert client.get(decision.key) == decision.owner_token
+    assert client.get(decision.key) == COOLDOWN_ARMED_VALUE
+    assert 0 < client.ttl(decision.key) <= 180
+
+    # Arming retired the run_id token: even the owner can no longer extend
+    # or delete the claim (release here would be a C11 error-path bug).
+    assert gate.activate(decision) is False
+    assert gate.release(decision) is False
+    assert client.get(decision.key) == COOLDOWN_ARMED_VALUE
     assert 0 < client.ttl(decision.key) <= 180
 
     client.set(decision.key, "replacement", ex=23)

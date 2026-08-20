@@ -14,6 +14,10 @@ from typing import Any
 
 COOLDOWN_SCHEME_VER = 1
 COOLDOWN_PROVISIONAL_TTL_SECONDS = 30
+# Value an armed claim rotates to on activation (contracts §Redis keys: "the
+# value may become `done`"). Rotating retires the run_id ownership token, so
+# no later release() can drop an armed cooldown.
+COOLDOWN_ARMED_VALUE = "done"
 
 
 class MissingCooldownField(ValueError):

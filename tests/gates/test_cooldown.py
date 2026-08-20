@@ -7,6 +7,7 @@ import pytest
 
 from src.bl.gates.cooldown import CooldownDecision, CooldownGate
 from src.contracts.cooldown import (
+    COOLDOWN_ARMED_VALUE,
     COOLDOWN_PROVISIONAL_TTL_SECONDS,
     COOLDOWN_SCHEME_VER,
     canonical_cooldown_bytes,
@@ -74,7 +75,7 @@ class FakeRedis:
     def register_script(self, script):
         if "register_script" in self.fail_on:
             raise ConnectionError("redis down")
-        operation = "activate" if "EXPIRE" in script else "release"
+        operation = "release" if "DEL" in script else "activate"
         self.calls.append(("register_script", operation))
 
         def execute(*, keys, args, client=None):
@@ -86,7 +87,8 @@ class FakeRedis:
             if self.values.get(key) != args[0]:
                 return 0
             if operation == "activate":
-                self.ttls[key] = int(args[1])
+                self.values[key] = args[1]
+                self.ttls[key] = int(args[2])
                 return 1
             del self.values[key]
             self.ttls.pop(key, None)
@@ -306,13 +308,28 @@ def test_ttl_metadata_error_still_suppresses():
 # -- owned lifecycle --------------------------------------------------------
 
 
-def test_activate_extends_full_ttl_only_for_owner():
+def test_activate_rotates_value_to_done_and_extends_full_ttl():
     redis = FakeRedis()
     cooldown_gate = gate(redis)
     decision = cooldown_gate.claim(message(), run_id=RUN_ID)
 
     assert cooldown_gate.activate(decision) is True
-    assert redis.values[decision.key] == RUN_ID
+    assert redis.values[decision.key] == COOLDOWN_ARMED_VALUE
+    assert redis.ttls[decision.key] == 300
+
+
+def test_armed_claim_is_immutable_even_to_its_own_owner():
+    redis = FakeRedis()
+    cooldown_gate = gate(redis)
+    decision = cooldown_gate.claim(message(), run_id=RUN_ID)
+    assert cooldown_gate.activate(decision) is True
+
+    # The run_id token is retired on arming: a late release() on the same
+    # decision (a C11 error-path bug) must not drop the armed cooldown, and
+    # a second activate must not re-extend it.
+    assert cooldown_gate.release(decision) is False
+    assert cooldown_gate.activate(decision) is False
+    assert redis.values[decision.key] == COOLDOWN_ARMED_VALUE
     assert redis.ttls[decision.key] == 300
 
 

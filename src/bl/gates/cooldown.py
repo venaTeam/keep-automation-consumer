@@ -5,7 +5,9 @@ submit/commit orchestration.  C10 provides the complete state machine C11 will
 call:
 
 * claim: ``SET key run_id NX EX 30``;
-* activate after ``200 accepted``: compare owner and extend atomically;
+* activate after ``200 accepted``: compare owner, then atomically rotate the
+  value to ``done`` and extend to the full window — an armed claim carries no
+  live ownership token, so no later ``release`` (stale or buggy) can drop it;
 * release after failure/429/non-accepted 200: compare owner and delete atomically.
 
 Redis is best-effort.  A claim error fails open, while an NX loss is a definite
@@ -21,6 +23,7 @@ from typing import Any, Callable, Optional, Protocol
 from uuid import UUID
 
 from src.contracts.cooldown import (
+    COOLDOWN_ARMED_VALUE,
     COOLDOWN_PROVISIONAL_TTL_SECONDS,
     COOLDOWN_SCHEME_VER,
     MissingCooldownField,
@@ -44,7 +47,8 @@ REASON_MISSING_FIELD = "missing_field"
 
 _ACTIVATE_SCRIPT = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
-  return redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+  return 1
 end
 return 0
 """.strip()
@@ -234,7 +238,12 @@ class CooldownGate:
         )
 
     def activate(self, decision: CooldownDecision) -> bool:
-        """Arm the full cooldown only if this decision still owns the key."""
+        """Arm the full cooldown only if this decision still owns the key.
+
+        Arming rotates the value from the run_id to ``COOLDOWN_ARMED_VALUE``,
+        retiring the ownership token: once armed, neither this decision's
+        ``release`` nor a stale claimant can extend or delete the claim.
+        """
         if not self._has_owned_claim(decision):
             return False
         try:
@@ -245,7 +254,11 @@ class CooldownGate:
             return bool(
                 activate(
                     keys=[decision.key],
-                    args=[decision.owner_token, decision.cooldown_seconds],
+                    args=[
+                        decision.owner_token,
+                        COOLDOWN_ARMED_VALUE,
+                        decision.cooldown_seconds,
+                    ],
                     client=client,
                 )
             )
