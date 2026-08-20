@@ -13,7 +13,7 @@ import pytest
 from redis import Redis
 
 from src.bl.gates.cooldown import CooldownGate
-from src.contracts.cooldown import COOLDOWN_ARMED_VALUE
+from src.bl.gates.cooldown_key import COOLDOWN_ARMED_VALUE
 from src.models.cooldown import CooldownOutcome
 from src.models.matched_message import MatchedAlertMessage
 

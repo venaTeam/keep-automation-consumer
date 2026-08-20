@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from src.bl.gates.cooldown import CooldownDecision, CooldownGate
-from src.contracts.cooldown import (
+from src.bl.gates.cooldown_key import (
     COOLDOWN_ARMED_VALUE,
     COOLDOWN_PROVISIONAL_TTL_SECONDS,
     COOLDOWN_SCHEME_VER,

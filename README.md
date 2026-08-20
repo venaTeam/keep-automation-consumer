@@ -100,7 +100,7 @@ with a logging stub until D17/D19 expose the endpoint.
 | `src/models/matched_message.py` | Matched-message shape (contracts §"Matched message"). |
 | `src/bl/gates/idempotency.py` | Idempotency gate (C9). |
 | `src/bl/gates/cooldown.py` | Owned cooldown gate (C10); lifecycle wiring lands in C11. |
-| `src/contracts/cooldown.py` | Consumer-side copy of the doc-authoritative key canonicalization. |
+| `src/bl/gates/cooldown_key.py` | Cooldown key + entity-hash construction, mirroring `automation-contracts.md` §Redis keys (the doc is authoritative; golden byte/hash fixtures in tests pin the mirror). |
 | `src/bl/suppression_audit.py` | Suppression audit Protocol + logging stub (D17 swaps it). |
 
 Ports: health **8092**, metrics **8094**.

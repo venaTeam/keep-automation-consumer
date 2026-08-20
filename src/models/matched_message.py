@@ -1,8 +1,8 @@
 """Matched-alert message shape (contracts §"Matched message").
 
 `automation-contracts.md` is authoritative; this model follows it, never the reverse.
-Skeleton uses a dependency-free dataclass. The A2 contracts package (Pydantic v1)
-supersedes this field-for-field once vendored; kept minimal here on purpose.
+Deliberately a dependency-free dataclass: there is no shared contracts package —
+each repo mirrors only the slice of the doc it uses, kept honest by tests.
 
 Required top-level keys (`tenant_id`, `alert`, `automation_id`) are read with `[]`,
 so a message missing one raises `KeyError` instead of deserializing into a partial
