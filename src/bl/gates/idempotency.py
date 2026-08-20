@@ -117,13 +117,15 @@ class IdempotencyGate:
         self._breaker_lock = threading.Lock()
 
     # -- circuit breaker ---------------------------------------------------
-    #
-    # State changes are synchronized because one gate is shared by all workers.
-    # Healthy calls do not hold the lock during Redis I/O. An initial outage can
-    # therefore have at most the already-running worker count in flight; once
-    # open, only one half-open probe is admitted per window.
 
     def _breaker_allows_call(self) -> bool:
+        """Admit Redis work while enforcing one half-open probe per window.
+
+        State changes are synchronized because one gate is shared by all
+        workers. Healthy calls do not hold the lock during Redis I/O. An initial
+        outage can therefore have at most the already-running worker count in
+        flight; once open, only one half-open probe is admitted per window.
+        """
         now = self._clock()
         with self._breaker_lock:
             if now < self._breaker_open_until:
