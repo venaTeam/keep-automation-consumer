@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from src.bl.gates.cooldown import CooldownDecision, CooldownGate
+from src.bl.gates.cooldown import CooldownGate
 from src.bl.gates.cooldown_key import (
     COOLDOWN_ARMED_VALUE,
     COOLDOWN_PROVISIONAL_TTL_SECONDS,
@@ -14,7 +14,7 @@ from src.bl.gates.cooldown_key import (
     canonical_cooldown_hash,
     cooldown_key,
 )
-from src.models.cooldown import CooldownOutcome
+from src.models.cooldown import CooldownDecision, CooldownOutcome
 from src.models.matched_message import MatchedAlertMessage
 
 AUTOMATION_ID = "3f2b8c1e-4d6a-4b2f-9e77-0a1b2c3d4e5f"

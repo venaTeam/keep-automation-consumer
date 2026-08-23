@@ -1,34 +1,22 @@
-"""Owned per-entity cooldown gate (C10).
-
-The gate is intentionally not wired into the Kafka pipeline here; C11 owns the
-submit/commit orchestration.  C10 provides the complete state machine C11 will
-call:
-
-* claim: ``SET key run_id NX EX 30``;
-* activate after ``200 accepted``: compare owner, then atomically rotate the
-  value to ``done`` and extend to the full window — an armed claim carries no
-  live ownership token, so no later ``release`` (stale or buggy) can drop it;
-* release after failure/429/non-accepted 200: compare owner and delete atomically.
-
-Redis is best-effort.  A claim error fails open, while an NX loss is a definite
-suppression and never refreshes the winner's TTL.
-"""
+"""Best-effort owned cooldown decisions; C11 wires them into submit flow."""
 
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Optional, Protocol
+from typing import Callable, Optional
 from uuid import UUID
 
 from src.bl.gates.cooldown_key import (
-    COOLDOWN_ARMED_VALUE,
     COOLDOWN_PROVISIONAL_TTL_SECONDS,
     COOLDOWN_SCHEME_VER,
     MissingCooldownField,
     canonical_cooldown_hash,
     cooldown_key,
+)
+from src.bl.gates.cooldown_redis import (
+    CooldownRedisLifecycle,
+    RedisCooldownClient,
 )
 from src.config.consts import REDIS_ERROR_LOG_INTERVAL_SECONDS
 from src.core.metrics import (
@@ -36,7 +24,7 @@ from src.core.metrics import (
     cooldown_decision_counters,
     redis_error_counters,
 )
-from src.models.cooldown import CooldownOutcome
+from src.models.cooldown import CooldownDecision, CooldownOutcome
 from src.models.matched_message import MatchedAlertMessage
 
 logger = logging.getLogger(__name__)
@@ -45,67 +33,9 @@ REASON_REDIS_UNAVAILABLE = "redis_unavailable"
 REASON_INVALID_CONFIG = "invalid_config"
 REASON_MISSING_FIELD = "missing_field"
 
-_ACTIVATE_SCRIPT = """
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
-  return 1
-end
-return 0
-""".strip()
-
-_RELEASE_SCRIPT = """
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  return redis.call('DEL', KEYS[1])
-end
-return 0
-""".strip()
-
-
-class RedisScript(Protocol):
-    def __call__(
-        self,
-        *,
-        keys: list[str],
-        args: list[Any],
-        client: Any = None,
-    ) -> Any: ...
-
-
-class RedisCooldownClient(Protocol):
-    def set(
-        self,
-        key: str,
-        value: str,
-        *,
-        nx: bool = False,
-        ex: Optional[int] = None,
-    ) -> Any: ...
-
-    def ttl(self, key: str) -> int: ...
-
-    def register_script(self, script: str) -> RedisScript: ...
-
-
 RedisClientFactory = Callable[[], Optional[RedisCooldownClient]]
 WallClock = Callable[[], float]
 MonotonicClock = Callable[[], float]
-
-
-@dataclass(frozen=True)
-class CooldownDecision:
-    outcome: CooldownOutcome
-    key: Optional[str] = None
-    entity_hash: Optional[str] = None
-    cooldown_seconds: Optional[int] = None
-    owner_token: Optional[str] = field(default=None, repr=False)
-    eligible_again_in_seconds: Optional[int] = None
-    next_eligible_at: Optional[datetime] = None
-    missing_fields: tuple[str, ...] = ()
-    gate_flags: dict[str, str] = field(default_factory=dict)
-
-    @property
-    def should_submit(self) -> bool:
-        return self.outcome is not CooldownOutcome.SUPPRESSED
 
 
 class CooldownGate:
@@ -122,10 +52,7 @@ class CooldownGate:
         self._error_log_interval_seconds = max(0.0, error_log_interval_seconds)
         self._next_error_log_at = 0.0
         self._log_lock = threading.Lock()
-        self._script_lock = threading.Lock()
-        self._script_client: Optional[RedisCooldownClient] = None
-        self._activate_script: Optional[RedisScript] = None
-        self._release_script: Optional[RedisScript] = None
+        self._lifecycle = CooldownRedisLifecycle()
 
     def claim(
         self, message: MatchedAlertMessage, *, run_id: str
@@ -246,21 +173,18 @@ class CooldownGate:
         """
         if not self._has_owned_claim(decision):
             return False
+        assert decision.key is not None
+        assert decision.owner_token is not None
+        assert decision.cooldown_seconds is not None
         try:
             client = self._client_factory()
             if client is None:
                 return False
-            activate, _ = self._scripts(client)
-            return bool(
-                activate(
-                    keys=[decision.key],
-                    args=[
-                        decision.owner_token,
-                        COOLDOWN_ARMED_VALUE,
-                        decision.cooldown_seconds,
-                    ],
-                    client=client,
-                )
+            return self._lifecycle.activate(
+                client,
+                key=decision.key,
+                owner_token=decision.owner_token,
+                cooldown_seconds=decision.cooldown_seconds,
             )
         except Exception:  # noqa: BLE001
             self._redis_failed(RedisOperation.COOLDOWN_ACTIVATE)
@@ -270,33 +194,20 @@ class CooldownGate:
         """Delete the provisional key only if this decision still owns it."""
         if not self._has_owned_claim(decision):
             return False
+        assert decision.key is not None
+        assert decision.owner_token is not None
         try:
             client = self._client_factory()
             if client is None:
                 return False
-            _, release = self._scripts(client)
-            return bool(
-                release(
-                    keys=[decision.key],
-                    args=[decision.owner_token],
-                    client=client,
-                )
+            return self._lifecycle.release(
+                client,
+                key=decision.key,
+                owner_token=decision.owner_token,
             )
         except Exception:  # noqa: BLE001
             self._redis_failed(RedisOperation.COOLDOWN_RELEASE)
             return False
-
-    def _scripts(
-        self, client: RedisCooldownClient
-    ) -> tuple[RedisScript, RedisScript]:
-        with self._script_lock:
-            if client is not self._script_client:
-                self._activate_script = client.register_script(_ACTIVATE_SCRIPT)
-                self._release_script = client.register_script(_RELEASE_SCRIPT)
-                self._script_client = client
-            assert self._activate_script is not None
-            assert self._release_script is not None
-            return self._activate_script, self._release_script
 
     @staticmethod
     def _parse_config(config: object) -> Optional[tuple[list[str], int, int]]:
