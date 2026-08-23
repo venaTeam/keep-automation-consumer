@@ -5,11 +5,12 @@ Consumer service for the Keep **Automations** feature. It reads the
 the automation API's idempotent submit endpoint — committing the matched-topic
 offset only after an API-confirmed submit.
 
-> **Status: C8 skeleton + C9 idempotency gate.** The consume loop runs the
+> **Status: C8 skeleton + C9 idempotency gate + C10 cooldown gate.** The consume loop runs the
 > idempotency gate per message and logs the decision (duplicates are audited,
 > everything else would submit). Offsets are still **never committed**
 > (`enable.auto.commit=false`) and no submit call exists yet — those land in
-> C10 (cooldown) and C11 (submit + offset commit + fail-open).
+> C11 (submit + gate lifecycle wiring + offset commit + fail-open). C10 is
+> deliberately dark until that orchestration exists.
 
 ## Idempotency gate (C9)
 
@@ -38,6 +39,29 @@ short-circuits to fail-open without touching the socket, then lets one message
 probe when the window expires. Redis-error tracebacks are budgeted (the metric
 counts every failure; the log doesn't).
 
+## Cooldown gate (C10)
+
+The optional per-entity gate implements the contract-owned state machine:
+
+```text
+SET cooldown:{automation_id}:1:{entity_hash} {run_id} NX EX 30
+```
+
+The entity hash is deterministic: sort the declared fields, encode compact
+Unicode JSON `[field,value]` pairs, then SHA-256. Missing declared fields run
+without a key and carry a warning; an empty field list creates a
+whole-automation key. Losing NX suppresses without refreshing the winner's TTL.
+
+The claim value is an ownership token. `activate()` uses Lua to compare the
+stored value with `run_id` and, on match, atomically rotate it to `done` while
+extending to full `cooldown_seconds` — arming retires the token, so an armed
+claim can no longer be extended or deleted by anyone (a misplaced `release()`
+cannot drop a live cooldown). `release()` compares before deleting a still-
+provisional claim. A stale delivery therefore cannot mutate
+a replacement claim. The exact 30-second provisional TTL covers the future
+C11 submit/accept round trip; there is no watchdog. C11 will call `activate`
+only for `200 accepted` and `release` for failures, 429s, and other 200 statuses.
+
 | Env var | Default | |
 |---|---|---|
 | `REDIS_URL` | *(empty)* | Empty = gates disabled, everything fails open |
@@ -53,7 +77,8 @@ means "not scraped":
 | Metric | |
 |---|---|
 | `..._idempotency_decisions_total{outcome}` | `claimed` / `duplicate` / `ambiguous` / `fail_open`. **Ungated volume is this metric's `fail_open`, not `redis_errors`** — once the breaker is open no Redis call is attempted, so the error counter stops scaling with traffic |
-| `..._redis_errors_total{operation}` | the Redis-down signal (`claim` / `get` / `mark_done`) |
+| `..._cooldown_decisions_total{outcome}` | `disabled` / `claimed` / `suppressed` / `missing_field` / `fail_open` |
+| `..._redis_errors_total{operation}` | the Redis-down signal (`claim` / `get` / `mark_done` plus cooldown claim/TTL/activate/release) |
 | `..._gates_config_missing{setting}` | set at startup. `redis_url` = no URL configured; `redis_client` = URL set but the client could not be built (for example, a typo'd scheme) |
 | `..._handle_errors_total` | messages whose processing raised and were skipped by the poll-loop guard |
 | `..._worker_pool_saturated` / `..._worker_pool_saturation_events_total` | partitions paused because all workers are occupied; Kafka polling continues |
@@ -73,7 +98,10 @@ with a logging stub until D17/D19 expose the endpoint.
 | `src/config/` | Env config + constants (topic, group, ports, worker-pool size, Redis). |
 | `src/core/redis_client.py` | Process-lifetime Redis client (build once — a per-call pool leaks fds). |
 | `src/models/matched_message.py` | Matched-message shape (contracts §"Matched message"). |
-| `src/bl/gates/idempotency.py` | Idempotency gate (C9). Cooldown (C10) lands beside it. |
+| `src/bl/gates/idempotency.py` | Idempotency gate (C9). |
+| `src/bl/gates/cooldown.py` | Owned cooldown gate (C10); lifecycle wiring lands in C11. |
+| `src/bl/gates/cooldown_redis.py` | Atomic Redis activation/release mechanics for owned cooldown claims. |
+| `src/bl/gates/cooldown_key.py` | Cooldown key + entity-hash construction, mirroring `automation-contracts.md` §Redis keys (the doc is authoritative; golden byte/hash fixtures in tests pin the mirror). |
 | `src/bl/suppression_audit.py` | Suppression audit Protocol + logging stub (D17 swaps it). |
 
 Ports: health **8092**, metrics **8094**.
