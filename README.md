@@ -13,6 +13,13 @@ offset only after an API-confirmed submit.
 
 ## Idempotency gate (C9)
 
+B5 publishes the event identity as `alert.id`. The message model exposes that
+value through the existing `history_id` property used by the gate and audit
+interface, so the Redis key is effectively `idem:{alert.id}:{automation_id}`.
+For older queued messages, `alert.history_id` is read only when `id` is absent;
+when both fields exist, `id` wins. The full alert snapshot is preserved unchanged.
+API/database field names and the gate decision rules are unchanged.
+
 `SET idem:{history_id}:{automation_id} "pending" NX EX 24h` per message
 (`automation-contracts.md` §Redis keys, spec §5.2 step 1):
 

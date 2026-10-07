@@ -10,9 +10,7 @@ from src.core.kafka_consumer import build_consumer_config
 from src.models.matched_message import MatchedAlertMessage
 from tests.helpers import build_test_consumer
 
-# The canonical matched message, copied from automation-contracts.md
-# section "Matched message". That doc is authoritative — when it changes,
-# this fixture changes with it, never the other way round.
+# B5 matched-message shape: the event handler publishes alert.id.
 CANONICAL_MESSAGE = {
     "tenant_id": "keep",
     "alert": {
@@ -24,7 +22,7 @@ CANONICAL_MESSAGE = {
         "environment": "prod",
         "operator": "team-payments",
         "fingerprint": "abc123",
-        "history_id": "evt-789",
+        "id": "evt-789",
         "time_created": "2026-07-12T14:03:00Z",
     },
     # The doc elides the tail of the uuid ("3f2b..."); spelled out here.
@@ -67,6 +65,27 @@ def test_matched_message_from_bytes():
     assert msg.fingerprint == "abc123"
     assert msg.cooldown["seconds"] == 300
     assert msg.alert == CANONICAL_MESSAGE["alert"]
+
+
+@pytest.mark.parametrize(
+    "identity, expected",
+    [
+        ({"history_id": "legacy-event"}, "legacy-event"),
+        ({"id": "b5-event", "history_id": "legacy-event"}, "b5-event"),
+        ({"id": None, "history_id": "legacy-event"}, None),
+        ({"id": "", "history_id": "legacy-event"}, ""),
+        ({}, None),
+    ],
+)
+def test_event_identity_compatibility_preserves_alert(identity, expected):
+    alert = {k: v for k, v in CANONICAL_MESSAGE["alert"].items() if k != "id"}
+    alert.update(identity)
+    msg = MatchedAlertMessage.from_bytes(
+        _encode({**CANONICAL_MESSAGE, "alert": alert})
+    )
+
+    assert msg.history_id == expected
+    assert msg.alert == alert
 
 
 def test_matched_message_requires_tenant_id():
