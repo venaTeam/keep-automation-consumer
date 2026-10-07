@@ -48,7 +48,7 @@ MESSAGE = {
         "environment": "prod",
         "operator": "team-payments",
         "fingerprint": "abc123",
-        "history_id": HISTORY_ID,
+        "id": HISTORY_ID,
         "time_created": "2026-07-12T14:03:00Z",
     },
     "automation_id": AUTOMATION_ID,
@@ -154,6 +154,34 @@ def test_first_claim_is_claimed_and_stores_pending():
     assert decision.outcome is IdempotencyOutcome.CLAIMED
     assert decision.should_submit is True
     assert redis.values[decision.key] == "pending"
+
+
+def test_legacy_confirmation_suppresses_b5_redelivery_with_same_id():
+    redis = FakeRedis()
+    gate = gate_with(redis)
+    legacy_alert = dict(MESSAGE["alert"])
+    legacy_alert["history_id"] = legacy_alert.pop("id")
+    legacy = message(alert=legacy_alert)
+
+    assert gate.claim(legacy).outcome is IdempotencyOutcome.CLAIMED
+    assert gate.mark_done(legacy) is True
+    assert gate.claim(message()).outcome is IdempotencyOutcome.DUPLICATE
+
+
+def test_b5_id_controls_claim_and_confirmation_when_legacy_id_differs():
+    redis = FakeRedis()
+    gate = gate_with(redis)
+    mixed = message(alert={**MESSAGE["alert"], "history_id": "legacy-event"})
+
+    decision = gate.claim(mixed)
+    assert decision.key == idempotency_key(HISTORY_ID, AUTOMATION_ID)
+    assert gate.mark_done(mixed) is True
+    assert gate.claim(message()).outcome is IdempotencyOutcome.DUPLICATE
+    assert idempotency_key("legacy-event", AUTOMATION_ID) not in redis.values
+
+    # A new event with the same fingerprint must still proceed.
+    different_event = message(alert={**MESSAGE["alert"], "id": "evt-790"})
+    assert gate.claim(different_event).outcome is IdempotencyOutcome.CLAIMED
 
 
 def test_claim_ttl_defaults_to_the_contract_24h():
@@ -298,10 +326,10 @@ def test_read_error_after_nx_fail_fails_open():
     assert decision.should_submit is True
 
 
-def test_message_without_history_id_fails_open_and_arms_nothing():
+def test_message_without_event_identity_fails_open_and_arms_nothing():
     redis = FakeRedis()
     alert = dict(MESSAGE["alert"])
-    alert.pop("history_id")
+    alert.pop("id")
 
     decision = gate_with(redis).claim(message(alert=alert))
 

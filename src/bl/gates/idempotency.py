@@ -185,8 +185,8 @@ class IdempotencyGate:
         key = idempotency_key(history_id, message.automation_id)
 
         if not history_id:
-            # The matcher stamps `history_id` on every alert (contracts §Alert
-            # payload: always present). Without it the key would collapse to
+            # The message model maps B5's `alert.id` (or a legacy history_id)
+            # to history_id. Without it the key would collapse to
             # `idem:None:{automation_id}` and one automation's whole event
             # stream would share a single gate — the first event suppressing
             # every later one. Fail open instead: the DB constraint still
