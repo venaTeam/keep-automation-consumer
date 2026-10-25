@@ -41,6 +41,17 @@ idempotency_decisions = Counter(
     ["outcome"],
 )
 
+# Additive metric: preserve the existing outcome series used by dashboards.
+idempotency_fail_open = Counter(
+    "keep_automation_consumer_idempotency_fail_open_total",
+    "Idempotency fail-open decisions by bounded reason",
+    ["reason"],
+)
+idempotency_fail_open_counters = {
+    reason: idempotency_fail_open.labels(reason=reason)
+    for reason in ("missing_history_id", "redis_unavailable")
+}
+
 cooldown_decisions = Counter(
     "keep_automation_consumer_cooldown_decisions_total",
     "Cooldown-gate decisions by outcome",
