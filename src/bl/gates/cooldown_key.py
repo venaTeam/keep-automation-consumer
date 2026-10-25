@@ -41,8 +41,8 @@ def canonical_cooldown_bytes(
     """Return the exact UTF-8 bytes hashed by scheme 1."""
     if any(not isinstance(field, str) for field in fields):
         raise TypeError("cooldown fields must be strings")
-    if "history_id" in fields:
-        raise ValueError("history_id must never participate in a cooldown key")
+    if "id" in fields or "history_id" in fields:
+        raise ValueError("alert identity (id/history_id) must never participate in a cooldown key")
 
     sorted_fields = sorted(fields)
     missing = [field for field in sorted_fields if field not in alert]

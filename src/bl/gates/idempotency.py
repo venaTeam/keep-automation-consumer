@@ -47,6 +47,7 @@ from src.config.consts import (
 from src.core.metrics import (
     RedisOperation,
     idempotency_decision_counters,
+    idempotency_fail_open_counters,
     redis_error_counters,
 )
 from src.models.idempotency import IdempotencyOutcome
@@ -114,6 +115,7 @@ class IdempotencyGate:
         self._breaker_open_until = 0.0
         self._half_open_probe_in_flight = False
         self._next_error_log_at = 0.0
+        self._next_missing_id_log_at = 0.0
         self._breaker_lock = threading.Lock()
 
     # -- circuit breaker ---------------------------------------------------
@@ -191,12 +193,20 @@ class IdempotencyGate:
             # stream would share a single gate — the first event suppressing
             # every later one. Fail open instead: the DB constraint still
             # dedups, and submit is the safe side.
-            logger.warning(
-                "automations: matched message has no history_id "
-                "(automation_id=%s tenant_id=%s); idempotency gate skipped",
-                message.automation_id,
-                message.tenant_id,
-            )
+            now = self._clock()
+            with self._breaker_lock:
+                should_log = now >= self._next_missing_id_log_at
+                if should_log:
+                    self._next_missing_id_log_at = now + REDIS_ERROR_LOG_INTERVAL_SECONDS
+            if should_log:
+                logger.warning(
+                    "automations: matched message has no alert.id "
+                    "(legacy alert.history_id); idempotency gate skipped "
+                    "(automation_id=%r tenant_id=%r; further warnings suppressed for %ss)",
+                    message.automation_id,
+                    message.tenant_id,
+                    REDIS_ERROR_LOG_INTERVAL_SECONDS,
+                )
             return self._decide(
                 IdempotencyOutcome.FAIL_OPEN, key, REASON_MISSING_HISTORY_ID
             )
@@ -295,6 +305,7 @@ class IdempotencyGate:
         flags = {"idempotency": "skipped" if reason else outcome.value}
         if reason:
             flags["reason"] = reason
+            idempotency_fail_open_counters[reason].inc()
         return IdempotencyDecision(outcome=outcome, key=key, gate_flags=flags)
 
 

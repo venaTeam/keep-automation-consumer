@@ -480,6 +480,47 @@ class Clock:
         self.now += seconds
 
 
+def test_fail_open_reasons_count_each_message_including_open_breaker():
+    metric = "keep_automation_consumer_idempotency_fail_open_total"
+    missing_before = counter(metric, reason="missing_history_id")
+    redis_before = counter(metric, reason="redis_unavailable")
+    gate = IdempotencyGate(client_factory=lambda: None, clock=Clock())
+    gate.claim(message(alert={"fingerprint": "same-alert"}))
+    attempts = REDIS_BREAKER_FAILURE_THRESHOLD + 3
+    for _ in range(attempts):
+        gate.claim(message())
+    assert counter(metric, reason="missing_history_id") == missing_before + 1
+    assert counter(metric, reason="redis_unavailable") == redis_before + attempts
+
+
+def test_missing_id_warnings_share_budget_across_workers(caplog):
+    clock = Clock()
+    gate = IdempotencyGate(client_factory=lambda: None, clock=clock)
+    missing = message(alert={})
+    metric = "keep_automation_consumer_idempotency_fail_open_total"
+    before = counter(metric, reason="missing_history_id")
+    with caplog.at_level(logging.WARNING, logger="src.bl.gates.idempotency"):
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            decisions = list(pool.map(lambda _: gate.claim(missing), range(32)))
+        assert len(caplog.records) == 1
+        assert "alert.id" in caplog.records[0].getMessage()
+        assert all(d.should_submit for d in decisions)
+        assert counter(metric, reason="missing_history_id") == before + 32
+        clock.advance(REDIS_ERROR_LOG_INTERVAL_SECONDS)
+        gate.claim(missing)
+        assert len(caplog.records) == 2
+
+
+def test_missing_id_warning_does_not_hide_redis_outage(caplog):
+    gate = IdempotencyGate(
+        client_factory=lambda: FakeRedis(fail_on=["set"]), clock=Clock()
+    )
+    with caplog.at_level(logging.WARNING, logger="src.bl.gates.idempotency"):
+        gate.claim(message(alert={}))
+        gate.claim(message())
+    assert [r.levelno for r in caplog.records] == [logging.WARNING, logging.ERROR]
+
+
 def failing_gate(clock):
     redis = FakeRedis(fail_on=["set"])
     return IdempotencyGate(client_factory=lambda: redis, clock=clock), redis

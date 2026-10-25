@@ -132,6 +132,18 @@ def test_canonicalization_sorts_fields_and_pins_literal_bytes_and_hash():
     )
 
 
+@pytest.mark.parametrize("identity_field", ["id", "history_id"])
+def test_cooldown_rejects_event_identity_even_with_entity_fields(identity_field):
+    with pytest.raises(ValueError, match="identity"):
+        canonical_cooldown_bytes({identity_field: "evt-1", "site": "east"}, ["site", identity_field])
+
+
+def test_new_event_id_keeps_same_entity_cooldown_hash():
+    first = {"id": "evt-1", "site": "east"}
+    second = {"id": "evt-2", "site": "east"}
+    assert canonical_cooldown_hash(first, ["site"]) == canonical_cooldown_hash(second, ["site"])
+
+
 def test_canonicalization_empty_fields_is_whole_automation_vector():
     assert canonical_cooldown_bytes({}, []) == b"[]"
     assert (
@@ -244,6 +256,7 @@ def test_empty_fields_claims_a_whole_automation_key():
         {"fields": ["site"], "seconds": 300, "scheme_ver": True},
         {"fields": "site", "seconds": 300, "scheme_ver": 1},
         {"fields": ["history_id"], "seconds": 300, "scheme_ver": 1},
+        {"fields": ["id"], "seconds": 300, "scheme_ver": 1},
     ],
 )
 def test_invalid_config_fails_open_without_redis(cooldown):
