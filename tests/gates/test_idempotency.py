@@ -156,19 +156,15 @@ def test_first_claim_is_claimed_and_stores_pending():
     assert redis.values[decision.key] == "pending"
 
 
-def test_legacy_confirmation_suppresses_b5_redelivery_with_same_id():
+def test_id_only_confirmation_suppresses_b5_redelivery_with_same_id():
     redis = FakeRedis()
     gate = gate_with(redis)
-    legacy_alert = dict(MESSAGE["alert"])
-    legacy_alert["history_id"] = legacy_alert.pop("id")
-    legacy = message(alert=legacy_alert)
-
-    assert gate.claim(legacy).outcome is IdempotencyOutcome.CLAIMED
-    assert gate.mark_done(legacy) is True
+    assert gate.claim(message()).outcome is IdempotencyOutcome.CLAIMED
+    assert gate.mark_done(message()) is True
     assert gate.claim(message()).outcome is IdempotencyOutcome.DUPLICATE
 
 
-def test_b5_id_controls_claim_and_confirmation_when_legacy_id_differs():
+def test_b5_id_controls_claim_and_confirmation_when_history_id_differs():
     redis = FakeRedis()
     gate = gate_with(redis)
     mixed = message(alert={**MESSAGE["alert"], "history_id": "legacy-event"})

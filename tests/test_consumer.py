@@ -71,7 +71,7 @@ def test_matched_message_from_bytes():
 @pytest.mark.parametrize(
     "identity, expected",
     [
-        ({"history_id": "legacy-event"}, "legacy-event"),
+        ({"history_id": "legacy-event"}, None),
         ({"id": "b5-event", "history_id": "legacy-event"}, "b5-event"),
         ({"id": None, "history_id": "legacy-event"}, None),
         ({"id": "", "history_id": "legacy-event"}, ""),

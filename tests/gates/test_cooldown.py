@@ -36,6 +36,7 @@ BASE_MESSAGE = {
         "operator": "team-payments",
         "node_name": "api-01",
         "fingerprint": "abc123",
+        "id": "evt-789",
         "history_id": "evt-789",
         "time_created": "2026-07-12T14:03:00Z",
     },
@@ -132,10 +133,15 @@ def test_canonicalization_sorts_fields_and_pins_literal_bytes_and_hash():
     )
 
 
-@pytest.mark.parametrize("identity_field", ["id", "history_id"])
-def test_cooldown_rejects_event_identity_even_with_entity_fields(identity_field):
-    with pytest.raises(ValueError, match="identity"):
-        canonical_cooldown_bytes({identity_field: "evt-1", "site": "east"}, ["site", identity_field])
+def test_cooldown_rejects_id_even_with_entity_fields():
+    with pytest.raises(ValueError, match="id must"):
+        canonical_cooldown_bytes({"id": "evt-1", "site": "east"}, ["site", "id"])
+
+
+def test_history_id_is_just_an_entity_field_when_explicitly_selected():
+    assert canonical_cooldown_bytes(
+        {"history_id": "entity-value", "site": "east"}, ["history_id"]
+    ) == b'[["history_id","entity-value"]]'
 
 
 def test_new_event_id_keeps_same_entity_cooldown_hash():
@@ -167,12 +173,12 @@ def test_canonicalization_is_utf8_and_delimiter_safe():
     )
 
 
-def test_key_matches_contract_and_excludes_history_id():
+def test_key_matches_contract_and_excludes_id():
     entity_hash = canonical_cooldown_hash(BASE_MESSAGE["alert"], ["site"])
     key = cooldown_key(AUTOMATION_ID, COOLDOWN_SCHEME_VER, entity_hash)
 
     assert key == f"cooldown:{AUTOMATION_ID}:1:{entity_hash}"
-    assert BASE_MESSAGE["alert"]["history_id"] not in key
+    assert BASE_MESSAGE["alert"]["id"] not in key
 
 
 # -- decision table ---------------------------------------------------------
@@ -255,7 +261,6 @@ def test_empty_fields_claims_a_whole_automation_key():
         {"fields": ["site"], "seconds": 300, "scheme_ver": 2},
         {"fields": ["site"], "seconds": 300, "scheme_ver": True},
         {"fields": "site", "seconds": 300, "scheme_ver": 1},
-        {"fields": ["history_id"], "seconds": 300, "scheme_ver": 1},
         {"fields": ["id"], "seconds": 300, "scheme_ver": 1},
     ],
 )

@@ -187,8 +187,7 @@ class IdempotencyGate:
         key = idempotency_key(history_id, message.automation_id)
 
         if not history_id:
-            # The message model maps B5's `alert.id` (or a legacy history_id)
-            # to history_id. Without it the key would collapse to
+            # The message model maps B5's `alert.id` to history_id. Without it the key would collapse to
             # `idem:None:{automation_id}` and one automation's whole event
             # stream would share a single gate — the first event suppressing
             # every later one. Fail open instead: the DB constraint still
@@ -200,8 +199,7 @@ class IdempotencyGate:
                     self._next_missing_id_log_at = now + REDIS_ERROR_LOG_INTERVAL_SECONDS
             if should_log:
                 logger.warning(
-                    "automations: matched message has no alert.id "
-                    "(legacy alert.history_id); idempotency gate skipped "
+                    "automations: matched message has no alert.id; idempotency gate skipped "
                     "(automation_id=%r tenant_id=%r; further warnings suppressed for %ss)",
                     message.automation_id,
                     message.tenant_id,
