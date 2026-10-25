@@ -1,9 +1,10 @@
 """Matched-alert message shape (contracts §"Matched message").
 
-The B5 producer uses `alert.id` for event identity. The existing consumer/API
-name `history_id` maps to that value; older queued payloads may use `history_id`.
-Skeleton uses a dependency-free dataclass. The A2 contracts package (Pydantic v1)
-supersedes this field-for-field once vendored; kept minimal here on purpose.
+`automation-contracts.md` is authoritative; this model follows it, never the reverse.
+The B5 wire name `alert.id` maps to the existing consumer/API name `history_id`;
+older queued payloads may use `history_id` for the same alert identity.
+Deliberately a dependency-free dataclass: there is no shared contracts package —
+each repo mirrors only the slice of the doc it uses, kept honest by tests.
 
 Required top-level keys (`tenant_id`, `alert`, `automation_id`) are read with `[]`,
 so a message missing one raises `KeyError` instead of deserializing into a partial

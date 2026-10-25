@@ -3,6 +3,7 @@ from enum import Enum
 
 from prometheus_client import Counter, Gauge
 
+from src.models.cooldown import CooldownOutcome
 from src.models.idempotency import IdempotencyOutcome
 
 
@@ -10,6 +11,10 @@ class RedisOperation(str, Enum):
     CLAIM = "claim"
     GET = "get"
     MARK_DONE = "mark_done"
+    COOLDOWN_CLAIM = "cooldown_claim"
+    COOLDOWN_TTL = "cooldown_ttl"
+    COOLDOWN_ACTIVATE = "cooldown_activate"
+    COOLDOWN_RELEASE = "cooldown_release"
 
 
 class GateConfigSetting(str, Enum):
@@ -33,6 +38,12 @@ deserialize_errors = Counter(
 idempotency_decisions = Counter(
     "keep_automation_consumer_idempotency_decisions_total",
     "Idempotency-gate decisions by outcome",
+    ["outcome"],
+)
+
+cooldown_decisions = Counter(
+    "keep_automation_consumer_cooldown_decisions_total",
+    "Cooldown-gate decisions by outcome",
     ["outcome"],
 )
 
@@ -66,6 +77,10 @@ redis_error_counters = {
 idempotency_decision_counters = {
     outcome: idempotency_decisions.labels(outcome=outcome.value)
     for outcome in IdempotencyOutcome
+}
+cooldown_decision_counters = {
+    outcome: cooldown_decisions.labels(outcome=outcome.value)
+    for outcome in CooldownOutcome
 }
 gate_config_missing_gauges = {
     setting: gates_config_missing.labels(setting=setting.value)
