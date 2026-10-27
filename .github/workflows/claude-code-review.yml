@@ -67,6 +67,17 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 1
+      # Fetched here so Claude needs no gh api access; kept under .git so it is not a repo file.
+      - name: Collect earlier Claude review comments
+        if: steps.checks.outputs.pass == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/comments" \
+            --jq '.[] | select(.user.login == "claude[bot]") | {path, line, body}' \
+            > .git/claude-earlier-comments.jsonl
+          echo "$(wc -l < .git/claude-earlier-comments.jsonl) earlier Claude comment(s)."
       - if: steps.checks.outputs.pass == 'true'
         uses: anthropics/claude-code-action@v1
         with:
@@ -83,8 +94,9 @@ jobs:
             out at HEAD SHA in the working directory.
 
             1. Read the PR with `gh pr view PR --repo REPO` and `gh pr diff PR --repo REPO`.
-               Read earlier inline review comments with
-               `gh api repos/REPO/pulls/PR/comments --paginate` and note the ones by claude[bot].
+               Read Claude's earlier inline comments on this PR from
+               .git/claude-earlier-comments.jsonl (one JSON object per line with path, line
+               and body; empty when there are none).
             2. Collect the CLAUDE.md and AGENTS.md files that apply to the changed files: the
                repository root and every directory on the path to a changed file.
             3. Launch three subagents in parallel, each given the PR title, description and diff:
@@ -108,4 +120,4 @@ jobs:
                "Reviewed <first 7 characters of HEAD SHA>: <N> new issue(s), see the inline
                comments." or "Reviewed <first 7 characters of HEAD SHA>: no new issues found."
           claude_args: >-
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments:*)"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*)"
