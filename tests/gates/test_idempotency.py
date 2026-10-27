@@ -412,6 +412,35 @@ def test_each_duplicate_redelivery_is_suppressed_and_audited():
     assert auditor.rows[0]["fingerprint"] == "abc123"
 
 
+def test_duplicate_audit_receives_raw_message_values():
+    """Audit persistence must receive source values, not log-safe renderings."""
+    raw_tenant = "tenant\nraw"
+    raw_automation = "automation\\u000a"
+    raw_event_id = "evt\nraw"
+    payload = json.loads(json.dumps(MESSAGE))
+    payload["tenant_id"] = raw_tenant
+    payload["automation_id"] = raw_automation
+    payload["alert"]["id"] = raw_event_id
+
+    redis = FakeRedis()
+    gate = gate_with(redis)
+    auditor = RecordingAuditor()
+    consumer = build_test_consumer(
+        idempotency_gate=gate,
+        suppression_auditor=auditor,
+    )
+
+    raw = json.dumps(payload).encode("utf-8")
+    consumer._handle(raw)
+    assert gate.mark_done(MatchedAlertMessage.from_bytes(raw)) is True
+    consumer._handle(raw)
+
+    row = auditor.rows[0]
+    assert row["tenant_id"] == raw_tenant
+    assert row["automation_id"] == raw_automation
+    assert row["history_id"] == raw_event_id
+
+
 def test_a_failing_client_factory_does_not_escape_handle():
     """The gate's "nothing raises" contract must not depend on another module."""
 

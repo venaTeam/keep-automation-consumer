@@ -183,9 +183,9 @@ class MatchedAlertConsumer:
             # visible rather than silent (spec §7.5). C11 commits the offset here.
             try:
                 self._suppression_auditor.record_suppression(
-                    tenant_id=safe_log_value(message.tenant_id),
-                    automation_id=safe_log_value(message.automation_id),
-                    history_id=safe_log_value(message.history_id),
+                    tenant_id=message.tenant_id,
+                    automation_id=message.automation_id,
+                    history_id=message.history_id,
                     fingerprint=message.fingerprint,
                     reason=REASON_DUPLICATE,
                     gate_flags=decision.gate_flags,

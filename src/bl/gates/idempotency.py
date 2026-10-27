@@ -201,7 +201,7 @@ class IdempotencyGate:
             if should_log:
                 logger.warning(
                     "automations: matched message has no alert.id; idempotency gate skipped "
-                    "(automation_id=%r tenant_id=%r; further warnings suppressed for %ss)",
+                    "(automation_id=%s tenant_id=%s; further warnings suppressed for %ss)",
                     safe_log_value(message.automation_id),
                     safe_log_value(message.tenant_id),
                     REDIS_ERROR_LOG_INTERVAL_SECONDS,
