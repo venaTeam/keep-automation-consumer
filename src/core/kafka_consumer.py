@@ -31,6 +31,7 @@ from src.core.metrics import (
     worker_pool_saturated,
     worker_pool_saturation_events,
 )
+from src.core.safe_logging import safe_log_value
 from src.core.worker_pool import WorkerPool
 from src.models.idempotency import IdempotencyOutcome
 from src.models.matched_message import MatchedAlertMessage
@@ -182,9 +183,9 @@ class MatchedAlertConsumer:
             # visible rather than silent (spec §7.5). C11 commits the offset here.
             try:
                 self._suppression_auditor.record_suppression(
-                    tenant_id=message.tenant_id,
-                    automation_id=message.automation_id,
-                    history_id=message.history_id,
+                    tenant_id=safe_log_value(message.tenant_id),
+                    automation_id=safe_log_value(message.automation_id),
+                    history_id=safe_log_value(message.history_id),
                     fingerprint=message.fingerprint,
                     reason=REASON_DUPLICATE,
                     gate_flags=decision.gate_flags,
@@ -196,9 +197,9 @@ class MatchedAlertConsumer:
                 logger.exception(
                     "automations: could not audit a suppressed duplicate "
                     "tenant_id=%s automation_id=%s history_id=%s",
-                    message.tenant_id,
-                    message.automation_id,
-                    message.history_id,
+                    safe_log_value(message.tenant_id),
+                    safe_log_value(message.automation_id),
+                    safe_log_value(message.history_id),
                 )
             return
 
@@ -208,9 +209,9 @@ class MatchedAlertConsumer:
         logger.info(
             "Consumed matched message tenant_id=%s automation_id=%s history_id=%s "
             "matched_m=%s idempotency=%s (submit lands in C11; offset not committed)",
-            message.tenant_id,
-            message.automation_id,
-            message.history_id,
+            safe_log_value(message.tenant_id),
+            safe_log_value(message.automation_id),
+            safe_log_value(message.history_id),
             message.matched_m,
             decision.outcome.value,
         )
