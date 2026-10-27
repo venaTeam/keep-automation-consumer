@@ -11,22 +11,64 @@ concurrency:
 
 jobs:
   review:
+    name: Claude code review
     # Drafts are skipped; fork PRs are skipped because GitHub withholds secrets from them.
     if: >-
       !github.event.pull_request.draft &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     permissions:
       contents: read
       pull-requests: read
       issues: read
+      checks: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      # Review only once every other check on the PR head has finished and passed.
+      - name: Wait for the other checks to pass
+        id: checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          SELF: Claude code review
+        run: |
+          sleep 20
+          deadline=$((SECONDS + 3600))
+          stable=0
+          while :; do
+            runs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100" \
+              --jq '.check_runs[] | select(.name != env.SELF) | "\(.status) \(.conclusion) \(.name)"')
+            pending=$(grep -v '^completed ' <<<"$runs" || true)
+            if [ -z "$pending" ]; then
+              # Two quiet polls in a row, so late-starting workflows are not missed.
+              stable=$((stable + 1))
+              [ "$stable" -ge 2 ] && break
+            else
+              stable=0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::warning::Skipping Claude review: other checks still running after 60 minutes."
+              echo "pass=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 30
+          done
+          failed=$(grep -vE '^completed (success|skipped|neutral) ' <<<"$runs" || true)
+          if [ -n "$failed" ]; then
+            echo "::notice::Skipping Claude review because other checks did not pass."
+            echo "$failed"
+            echo "pass=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "${runs:-No other checks.}"
+            echo "pass=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.checks.outputs.pass == 'true'
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
-      - uses: anthropics/claude-code-action@v1
+      - if: steps.checks.outputs.pass == 'true'
+        uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
