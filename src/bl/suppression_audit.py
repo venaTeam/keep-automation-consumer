@@ -13,6 +13,8 @@ Only composition-root wiring changes when D17's client replaces the stub.
 import logging
 from typing import Optional, Protocol
 
+from src.core.safe_logging import safe_log_value
+
 logger = logging.getLogger(__name__)
 
 # `automation_runs.suppression_reason` values (contracts §DB enums). Only
@@ -55,10 +57,10 @@ class LoggingSuppressionAuditor:
         logger.info(
             "automations: suppressed run (audit pending D17) tenant_id=%s "
             "automation_id=%s history_id=%s fingerprint=%s reason=%s gate_flags=%s",
-            tenant_id,
-            automation_id,
-            history_id,
-            fingerprint,
-            reason,
-            gate_flags,
+            safe_log_value(tenant_id),
+            safe_log_value(automation_id),
+            safe_log_value(history_id),
+            safe_log_value(fingerprint),
+            safe_log_value(reason),
+            safe_log_value(gate_flags),
         )
