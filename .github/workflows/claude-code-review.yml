@@ -89,7 +89,8 @@ jobs:
       - if: steps.checks.outputs.pass == 'true'
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Max subscription token from `claude setup-token`; API keys bill Console credits instead.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # Own prompt instead of the code-review plugin, which skips any PR Claude has
           # already commented on; this reviews every push and skips repeated findings.
           prompt: |
