@@ -60,7 +60,7 @@ from src.core.metrics import (
 )
 from src.core.offset_tracker import OffsetTracker, PartitionKey
 from src.core.worker_pool import WorkerPool
-from src.models.matched_message import MatchedAlertMessage
+from src.models.matched_message import MalformedMessage, MatchedAlertMessage
 
 if TYPE_CHECKING:
     from confluent_kafka import Consumer, TopicPartition
@@ -273,6 +273,15 @@ class MatchedAlertConsumer:
         """Process one message. True when settled (its offset may commit)."""
         try:
             message = MatchedAlertMessage.from_bytes(raw)
+        except MalformedMessage as exc:
+            # Parsed, but no submit could ever carry it (contracts §Matched
+            # message). Settled (skipped) so it does not block its partition.
+            deserialize_errors.inc()
+            logger.error(
+                "Skipping malformed matched message (%s); its automation will NOT run",
+                exc,
+            )
+            return True
         except Exception:
             # Poison: no redelivery can make it parse. Settled (skipped) so it
             # does not block its partition.
@@ -425,7 +434,10 @@ class MatchedAlertConsumer:
                 return
             self._next_commit_at = now + KAFKA_COMMIT_INTERVAL_SECONDS
 
-        due = self._tracker.commits_due(keys)
+        # Synchronous commits (revoke, shutdown) re-send positions already
+        # handed to an async commit: that commit may still fail after this
+        # partition is forgotten, and its failure callback would then be lost.
+        due = self._tracker.commits_due(keys, include_committed=synchronous)
         if not due:
             return
         offsets = [

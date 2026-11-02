@@ -45,10 +45,15 @@ class InMemoryRedis:
         self.values: dict[str, str] = {}
         self.ttls: dict[str, Optional[int]] = {}
         self.fail_on = set(fail_on)
+        # Operations that fail exactly once, then work (a Redis blip).
+        self.fail_once: set[str] = set()
         self.calls: list[tuple] = []
 
     def _check(self, operation: str) -> None:
         self.calls.append((operation,))
+        if operation in self.fail_once:
+            self.fail_once.discard(operation)
+            raise ConnectionError("redis blip")
         if operation in self.fail_on or "*" in self.fail_on:
             raise ConnectionError("redis down")
 
@@ -72,12 +77,24 @@ class InMemoryRedis:
 
     def register_script(self, script):
         self._check("register_script")
-        operation = "release" if "DEL" in script else "activate"
+        if "DEL" in script:
+            operation = "release"
+        elif "EXPIRE" in script:
+            operation = "reclaim"
+        else:
+            operation = "activate"
 
         def execute(*, keys, args, client=None):
             del client
             self._check(operation)
             key = keys[0]
+            if operation == "reclaim":
+                current = self.values.get(key)
+                if current == args[0] or current is None:
+                    self.values[key] = args[0]
+                    self.ttls[key] = int(args[1])
+                    return 1
+                return 0
             if self.values.get(key) != args[0]:
                 return 0
             if operation == "activate":

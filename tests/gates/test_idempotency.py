@@ -269,11 +269,16 @@ def test_read_error_after_nx_fail_fails_open():
 
 
 def test_message_without_history_id_fails_open_and_arms_nothing():
+    """Gate-level guard. The consumer now rejects such a message before the
+    gate (MalformedMessage), so this is built directly, bypassing that check."""
     redis = FakeRedis()
     alert = dict(MESSAGE["alert"])
     alert.pop("history_id")
+    unvalidated = MatchedAlertMessage(
+        tenant_id="keep", alert=alert, automation_id=AUTOMATION_ID
+    )
 
-    decision = gate_with(redis).claim(message(alert=alert))
+    decision = gate_with(redis).claim(unvalidated)
 
     assert decision.outcome is IdempotencyOutcome.FAIL_OPEN
     assert decision.gate_flags["reason"] == "missing_history_id"

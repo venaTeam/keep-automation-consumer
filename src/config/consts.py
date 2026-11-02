@@ -94,15 +94,16 @@ AUTOMATION_API_URL = config("AUTOMATION_API_URL", default="")
 # name as keep-automation-api. Never logged.
 INTERNAL_SERVICE_TOKEN = config("INTERNAL_SERVICE_TOKEN", default="")
 
-# Submit acknowledges in seconds (early ack, spec §7.1). The read timeout is
-# capped well under the 30s provisional cooldown TTL (spec §7.6): an `accepted`
-# that arrives after the claim expired cannot arm the cooldown any more.
+# Submit acknowledges in seconds (early ack, spec §7.1). Clamped so connect +
+# write + read (httpx applies the timeout per phase) stays under the 30s
+# provisional cooldown TTL even at the caps (5 + 12 + 12 = 29s, spec §7.6): an
+# `accepted` that arrives after the claim expired cannot arm the cooldown.
 AUTOMATION_API_CONNECT_TIMEOUT_SECONDS = min(
     5.0,
     max(0.1, config("AUTOMATION_API_CONNECT_TIMEOUT_SECONDS", default="2.0", cast=float)),
 )
 AUTOMATION_API_TIMEOUT_SECONDS = min(
-    20.0,
+    12.0,
     max(1.0, config("AUTOMATION_API_TIMEOUT_SECONDS", default="10.0", cast=float)),
 )
 
@@ -118,8 +119,10 @@ IN_FLIGHT_DRAIN_TIMEOUT_SECONDS = (
 # Backoff between attempts of an unacknowledged submit (429 capacity, 5xx,
 # transport error). Capped exponential with jitter; retries continue until the
 # message settles, the consumer stops, or its partition is revoked.
+# Floored above zero: 200 workers retrying with no delay is a storm against
+# exactly the API that is struggling.
 SUBMIT_RETRY_BACKOFF_INITIAL_SECONDS = max(
-    0.0, config("SUBMIT_RETRY_BACKOFF_INITIAL_SECONDS", default="1.0", cast=float)
+    0.1, config("SUBMIT_RETRY_BACKOFF_INITIAL_SECONDS", default="1.0", cast=float)
 )
 SUBMIT_RETRY_BACKOFF_MAX_SECONDS = max(
     SUBMIT_RETRY_BACKOFF_INITIAL_SECONDS,

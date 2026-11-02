@@ -234,3 +234,24 @@ def test_redirects_are_not_followed():
 
     assert calls == [SUBMIT_PATH]
     assert result.outcome is SubmitOutcome.API_ERROR
+
+
+
+def test_unencodable_body_is_unsendable_and_never_sent():
+    sent = []
+
+    def handler(request):
+        sent.append(request)
+        return httpx.Response(200, json={"status": "accepted"})
+
+    request = SubmitRequest(**{**REQUEST.__dict__, "alert": {"score": float("inf")}})
+    result = _client(handler).submit(request)
+
+    assert result.outcome is SubmitOutcome.UNSENDABLE
+    assert result.acknowledged is False
+    assert sent == []
+
+
+def test_a_token_that_cannot_be_a_header_fails_at_construction():
+    with pytest.raises(UnicodeEncodeError):
+        _client(lambda request: httpx.Response(200), token="tökén")

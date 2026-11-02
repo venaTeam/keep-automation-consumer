@@ -75,7 +75,12 @@ class FakeRedis:
     def register_script(self, script):
         if "register_script" in self.fail_on:
             raise ConnectionError("redis down")
-        operation = "release" if "DEL" in script else "activate"
+        if "DEL" in script:
+            operation = "release"
+        elif "EXPIRE" in script:
+            operation = "reclaim"
+        else:
+            operation = "activate"
         self.calls.append(("register_script", operation))
 
         def execute(*, keys, args, client=None):
@@ -84,6 +89,16 @@ class FakeRedis:
             self.calls.append((operation, key, *args))
             if operation in self.fail_on:
                 raise ConnectionError("redis down")
+            if operation == "reclaim":
+                current = self.values.get(key)
+                if current == args[0]:
+                    self.ttls[key] = int(args[1])
+                    return 1
+                if current is None:
+                    self.values[key] = args[0]
+                    self.ttls[key] = int(args[1])
+                    return 1
+                return 0
             if self.values.get(key) != args[0]:
                 return 0
             if operation == "activate":
@@ -421,4 +436,44 @@ def test_registered_scripts_are_cached_for_shared_client():
     assert registrations == [
         ("register_script", "activate"),
         ("register_script", "release"),
+        ("register_script", "reclaim"),
     ]
+
+
+
+# -- re-entry (PR #13 CR, B1) ---------------------------------------------------
+
+
+def test_nx_loss_to_our_own_token_re_enters_and_refreshes_the_claim():
+    redis = FakeRedis()
+    first = gate(redis).claim(message(), run_id=RUN_ID)
+    redis.ttls[first.key] = 3  # most of the provisional window used up
+
+    again = gate(redis).claim(message(), run_id=RUN_ID)
+
+    assert again.outcome is CooldownOutcome.CLAIMED
+    assert again.owner_token == RUN_ID
+    assert redis.values[first.key] == RUN_ID
+    assert redis.ttls[first.key] == COOLDOWN_PROVISIONAL_TTL_SECONDS
+
+
+def test_nx_loss_to_another_token_still_suppresses_untouched():
+    redis = FakeRedis()
+    winner = gate(redis).claim(message(), run_id=WINNER_RUN_ID)
+    redis.ttls[winner.key] = 17
+
+    loser = gate(redis).claim(message(), run_id=LOSER_RUN_ID)
+
+    assert loser.outcome is CooldownOutcome.SUPPRESSED
+    assert redis.values[winner.key] == WINNER_RUN_ID
+    assert redis.ttls[winner.key] == 17
+
+
+def test_reclaim_failure_fails_open_rather_than_suppressing():
+    redis = FakeRedis(fail_on={"reclaim"})
+    gate(redis).claim(message(), run_id=WINNER_RUN_ID)
+
+    decision = gate(redis).claim(message(), run_id=LOSER_RUN_ID)
+
+    assert decision.outcome is CooldownOutcome.FAIL_OPEN
+    assert decision.gate_flags["cooldown_reason"] == "redis_unavailable"

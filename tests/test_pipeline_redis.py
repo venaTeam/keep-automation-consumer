@@ -178,6 +178,12 @@ def test_concurrent_redeliveries_converge_to_exactly_one_accepted_run(redis_clie
 
     outcomes = [r.outcome for r in results]
     assert outcomes.count("accepted") == 1
+    # The consumer's own state: the event is marked done and exactly one
+    # cooldown claim is armed for the full window.
+    assert client.get(idempotency_key(msg.history_id, automation_id)) == "done"
+    (key,) = cooldown_keys(client, automation_id)
+    assert client.get(key) == COOLDOWN_ARMED_VALUE
+    assert 290 <= client.ttl(key) <= 300
     assert set(outcomes) <= {
         "accepted",
         "already_submitted",

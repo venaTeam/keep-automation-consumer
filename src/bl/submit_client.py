@@ -81,7 +81,7 @@ class HttpSubmitClient:
         connect_timeout_seconds: float,
         transport: Optional[httpx.BaseTransport] = None,
     ) -> None:
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
         if service_token:
             headers["Authorization"] = f"Bearer {service_token}"
         self._client_kwargs = {
@@ -99,10 +99,18 @@ class HttpSubmitClient:
         self._local = threading.local()
         self._clients: list[httpx.Client] = []
         self._lock = threading.Lock()
+        # Build one client now so a bad setting (e.g. a token that is not
+        # ASCII-encodable as a header) fails startup instead of failing every
+        # worker's first submit.
+        httpx.Client(**self._client_kwargs).close()
 
     def submit(self, request: SubmitRequest) -> SubmitResult:
         try:
-            response = self._thread_client().post(SUBMIT_PATH, json=request.to_dict())
+            body = encode_body(request)
+        except (TypeError, ValueError) as exc:
+            return SubmitResult(SubmitOutcome.UNSENDABLE, error=type(exc).__name__)
+        try:
+            response = self._thread_client().post(SUBMIT_PATH, content=body)
         except httpx.TimeoutException as exc:
             return SubmitResult(
                 SubmitOutcome.TRANSPORT_ERROR, error=f"timeout:{type(exc).__name__}"
@@ -125,6 +133,14 @@ class HttpSubmitClient:
             with self._lock:
                 self._clients.append(client)
         return client
+
+
+def encode_body(request: SubmitRequest) -> bytes:
+    """Strict JSON, as httpx would encode it — raises on NaN/Infinity or a
+    non-JSON value, which no retry can fix."""
+    return json.dumps(
+        request.to_dict(), ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
 
 
 def classify_response(status_code: int, body: bytes) -> SubmitResult:

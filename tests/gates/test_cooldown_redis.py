@@ -136,3 +136,23 @@ def test_compare_and_delete_requires_current_owner(redis_client):
     client.set(decision.key, decision.owner_token, ex=30)
     assert gate.release(decision) is True
     assert client.exists(decision.key) == 0
+
+
+
+def test_reclaim_re_enters_only_our_own_claim(redis_client):
+    client, remember = redis_client
+    automation_id = str(uuid4())
+    gate = CooldownGate(client_factory=lambda: client)
+    run_id, other_run_id = str(uuid4()), str(uuid4())
+
+    first = gate.claim(message(automation_id), run_id=run_id)
+    remember(first.key)
+    client.expire(first.key, 3)
+
+    again = gate.claim(message(automation_id), run_id=run_id)
+    other = gate.claim(message(automation_id), run_id=other_run_id)
+
+    assert again.outcome is CooldownOutcome.CLAIMED
+    assert 25 <= client.ttl(first.key) <= 30  # refreshed, not left at 3
+    assert other.outcome is CooldownOutcome.SUPPRESSED
+    assert client.get(first.key) == run_id

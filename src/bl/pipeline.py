@@ -8,11 +8,13 @@ One attempt is the whole sequence a Kafka redelivery would run:
 |---|---|---|---|
 | idem `duplicate` | — | not claimed | yes — audit `duplicate` |
 | cooldown `suppressed` | — | the other claimant's, untouched | yes — audit `cooldown` |
-| 200 `accepted` | → `done` | compare-and-extend (armed) | yes |
-| 200 `already_submitted` / `suppressed` | → `done` | compare-and-delete | yes |
+| 200 `accepted`, or `already_submitted` with our own `run_id` | → `done` | compare-and-extend (armed) | yes |
+| any other 200 `already_submitted` / `suppressed` | → `done` | compare-and-delete | yes |
 | 429 `capacity` | stays `pending` | compare-and-delete | no — retry (+ capacity metric) |
 | 5xx / 408 / 401 / 403 / transport / invalid 200 | stays `pending` | compare-and-delete | no — retry |
 | 400 / 404 / 409 / 422 + typed refusal body | stays `pending` | compare-and-delete | yes — skipped, loud |
+| body unencodable (NaN in `alert`) — nothing sent | stays `pending` | compare-and-delete | yes — skipped, loud |
+| unexpected exception in an attempt | stays `pending` | compare-and-delete | no — retry, counted |
 
 Redis unavailable at the idempotency gate ⇒ the cooldown gate is skipped
 without a Redis call, and the submit carries `gate_flags` saying so (spec §6.3:
@@ -56,6 +58,7 @@ from src.core.metrics import (
     FailOpenReason,
     fail_open_submit_counters,
     messages_abandoned_counters,
+    pipeline_errors,
     submit_capacity_backoffs,
     submit_duration,
     submit_outcome_counters,
@@ -135,7 +138,15 @@ class SubmitPipeline:
                 self._abandon(message, abandon_reason)
                 return None
 
-            result = self.process_once(message, run_id=run_id)
+            try:
+                result = self.process_once(message, run_id=run_id)
+            except Exception:  # noqa: BLE001
+                # A bug or an unforeseen library error: the attempt already
+                # released its claim. Retrying is recoverable once fixed;
+                # committing past the message would lose it for good.
+                pipeline_errors.inc()
+                self._log_attempt_error(message)
+                result = AttemptResult(settled=False, outcome="error")
             if result.settled:
                 return result
 
@@ -199,6 +210,27 @@ class SubmitPipeline:
             )
             return AttemptResult(settled=True, outcome="cooldown_suppressed")
 
+        try:
+            return self._submit_and_settle(
+                message, run_id=run_id, gate_flags=gate_flags,
+                idempotency=idempotency, cooldown=cooldown,
+            )
+        except BaseException:
+            # Never leave a provisional claim behind an attempt that blew up:
+            # it would suppress the entity — or this message's own retry —
+            # for 30s with nothing accepted. A no-op once armed or released.
+            self._cooldown_gate.release(cooldown)
+            raise
+
+    def _submit_and_settle(
+        self,
+        message: MatchedAlertMessage,
+        *,
+        run_id: str,
+        gate_flags: dict[str, str],
+        idempotency,
+        cooldown: CooldownDecision,
+    ) -> AttemptResult:
         if idempotency.outcome is IdempotencyOutcome.FAIL_OPEN:
             self._count_fail_open_submit(idempotency.reason)
 
@@ -219,7 +251,10 @@ class SubmitPipeline:
             # into an audited duplicate instead of another submit. A failed
             # write costs one extra idempotent submit, never correctness.
             self._idempotency_gate.mark_done(message)
-            if result.outcome is SubmitOutcome.ACCEPTED:
+            if result.outcome is SubmitOutcome.ACCEPTED or _is_own_run(result, run_id):
+                # `already_submitted` carrying our own run_id: an earlier
+                # attempt of this delivery was accepted but its response was
+                # lost — the run did start under this claim, so arm it.
                 self._arm_cooldown(message, cooldown, run_id)
             else:
                 self._cooldown_gate.release(cooldown)
@@ -231,7 +266,7 @@ class SubmitPipeline:
 
         if result.outcome is SubmitOutcome.CAPACITY:
             submit_capacity_backoffs.inc()
-        elif result.outcome is SubmitOutcome.REJECTED:
+        elif result.outcome in (SubmitOutcome.REJECTED, SubmitOutcome.UNSENDABLE):
             self._record_rejection(message, result, run_id)
             return AttemptResult(settled=True, outcome=result.outcome.value)
         return AttemptResult(settled=False, outcome=result.outcome.value)
@@ -273,18 +308,22 @@ class SubmitPipeline:
     def _record_rejection(
         message: MatchedAlertMessage, result: SubmitResult, run_id: str
     ) -> None:
-        status = result.http_status
-        counter = submit_rejection_counters.get(status)
+        label = (
+            "unsendable"
+            if result.outcome is SubmitOutcome.UNSENDABLE
+            else str(result.http_status)
+        )
+        counter = submit_rejection_counters.get(label)
         if counter is None:
-            counter = submit_rejections.labels(status=str(status))
+            counter = submit_rejections.labels(status=label)
         counter.inc()
         # Logged unbudgeted, at ERROR: each line is the only record of a
         # matched alert whose automation will not run.
         logger.error(
-            "automations: submit definitively refused (http %s); skipping the "
+            "automations: submit definitively refused (%s); skipping the "
             "message, its automation will NOT run tenant_id=%s automation_id=%s "
             "history_id=%s run_id=%s",
-            status,
+            label if label == "unsendable" else f"http {label}",
             message.tenant_id,
             message.automation_id,
             message.history_id,
@@ -317,6 +356,22 @@ class SubmitPipeline:
                 "automations: could not audit a %s suppression "
                 "tenant_id=%s automation_id=%s history_id=%s",
                 reason,
+                message.tenant_id,
+                message.automation_id,
+                message.history_id,
+            )
+
+    def _log_attempt_error(self, message: MatchedAlertMessage) -> None:
+        """Budgeted traceback: a systematic bug would otherwise log per attempt."""
+        now = self._monotonic_clock()
+        with self._log_lock:
+            should_log = now >= self._next_retry_log_at
+            if should_log:
+                self._next_retry_log_at = now + self._retry_log_interval_seconds
+        if should_log:
+            logger.exception(
+                "automations: submit attempt raised; claim released, retrying "
+                "tenant_id=%s automation_id=%s history_id=%s",
                 message.tenant_id,
                 message.automation_id,
                 message.history_id,
@@ -358,6 +413,14 @@ class SubmitPipeline:
             message.automation_id,
             message.history_id,
         )
+
+
+def _is_own_run(result: SubmitResult, run_id: str) -> bool:
+    return (
+        result.outcome is SubmitOutcome.ALREADY_SUBMITTED
+        and result.response is not None
+        and result.response.run_id == run_id
+    )
 
 
 def _cooldown_detail(decision: CooldownDecision) -> dict[str, Any]:

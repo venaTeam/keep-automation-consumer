@@ -134,6 +134,28 @@ class CooldownGate:
                 reason=REASON_REDIS_UNAVAILABLE,
             )
 
+        if not claimed:
+            # The run_id is reused across this delivery's retries, so a key
+            # holding it is our own earlier claim whose release (or claim
+            # reply) was lost to a Redis blip. Suppressing on it would make the
+            # message suppress itself and be committed with nothing submitted.
+            try:
+                claimed = self._lifecycle.reclaim(
+                    client,
+                    key=key,
+                    owner_token=run_id,
+                    ttl_seconds=COOLDOWN_PROVISIONAL_TTL_SECONDS,
+                )
+            except Exception:  # noqa: BLE001 - unsure whose claim it is: run
+                self._redis_failed(RedisOperation.COOLDOWN_RECLAIM)
+                return self._decide(
+                    CooldownOutcome.FAIL_OPEN,
+                    key=key,
+                    entity_hash=entity_hash,
+                    cooldown_seconds=seconds,
+                    reason=REASON_REDIS_UNAVAILABLE,
+                )
+
         if claimed:
             return self._decide(
                 CooldownOutcome.CLAIMED,

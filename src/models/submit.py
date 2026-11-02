@@ -35,6 +35,9 @@ class SubmitOutcome(str, Enum):
     TRANSPORT_ERROR = "transport_error"
     # HTTP 200 without a known `status`: not an acknowledgement.
     INVALID_RESPONSE = "invalid_response"
+    # The request body could not be encoded (e.g. NaN in `alert`): nothing was
+    # sent and no attempt ever could be.
+    UNSENDABLE = "unsendable"
 
 
 ACKNOWLEDGED_OUTCOMES = frozenset(

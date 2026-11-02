@@ -20,6 +20,24 @@ end
 return 0
 """.strip()
 
+# Runs only after a plain `SET NX` lost. Our own token still there means an
+# earlier attempt of this same delivery claimed it and its release (or the
+# claim's reply) never landed: re-enter and refresh. A key that vanished in
+# between is simply claimed. Anything else is another claimant's.
+_RECLAIM_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if current == ARGV[1] then
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+  return 1
+end
+if not current then
+  if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', tonumber(ARGV[2])) then
+    return 1
+  end
+end
+return 0
+""".strip()
+
 
 class RedisScript(Protocol):
     def __call__(
@@ -54,6 +72,19 @@ class CooldownRedisLifecycle:
         self._client: RedisCooldownClient | None = None
         self._activate_script: RedisScript | None = None
         self._release_script: RedisScript | None = None
+        self._reclaim_script: RedisScript | None = None
+
+    def reclaim(
+        self,
+        client: RedisCooldownClient,
+        *,
+        key: str,
+        owner_token: str,
+        ttl_seconds: int,
+    ) -> bool:
+        """Re-enter a claim this token already holds (or claim a vanished key)."""
+        _, _, reclaim = self._scripts(client)
+        return bool(reclaim(keys=[key], args=[owner_token, ttl_seconds], client=client))
 
     def activate(
         self,
@@ -63,7 +94,7 @@ class CooldownRedisLifecycle:
         owner_token: str,
         cooldown_seconds: int,
     ) -> bool:
-        activate, _ = self._scripts(client)
+        activate, _, _ = self._scripts(client)
         return bool(
             activate(
                 keys=[key],
@@ -79,7 +110,7 @@ class CooldownRedisLifecycle:
         key: str,
         owner_token: str,
     ) -> bool:
-        _, release = self._scripts(client)
+        _, release, _ = self._scripts(client)
         return bool(
             release(
                 keys=[key],
@@ -90,12 +121,14 @@ class CooldownRedisLifecycle:
 
     def _scripts(
         self, client: RedisCooldownClient
-    ) -> tuple[RedisScript, RedisScript]:
+    ) -> tuple[RedisScript, RedisScript, RedisScript]:
         with self._lock:
             if client is not self._client:
                 self._activate_script = client.register_script(_ACTIVATE_SCRIPT)
                 self._release_script = client.register_script(_RELEASE_SCRIPT)
+                self._reclaim_script = client.register_script(_RECLAIM_SCRIPT)
                 self._client = client
             assert self._activate_script is not None
             assert self._release_script is not None
-            return self._activate_script, self._release_script
+            assert self._reclaim_script is not None
+            return self._activate_script, self._release_script, self._reclaim_script

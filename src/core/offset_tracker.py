@@ -98,10 +98,15 @@ class OffsetTracker:
             return state is not None and state.epoch == epoch
 
     def commits_due(
-        self, keys: Optional[Iterable[PartitionKey]] = None
+        self,
+        keys: Optional[Iterable[PartitionKey]] = None,
+        *,
+        include_committed: bool = False,
     ) -> list[tuple[PartitionKey, int]]:
         """Positions that moved past the last commit (all partitions, or `keys`).
 
+        `include_committed` also returns positions already committed — for a
+        final synchronous commit that must not trust an async one in flight.
         The caller commits them and then calls `mark_committed`.
         """
         with self._lock:
@@ -111,7 +116,9 @@ class OffsetTracker:
             due = []
             for key, state in selected.items():
                 position = state.position()
-                if position is not None and position != state.last_committed:
+                if position is not None and (
+                    include_committed or position != state.last_committed
+                ):
                     due.append((key, position))
             return due
 

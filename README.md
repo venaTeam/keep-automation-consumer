@@ -20,16 +20,21 @@ Per message (spec §5.2, `src/bl/pipeline.py`):
 |---|---|---|---|
 | idem `duplicate` | — | not claimed | **commit** — audit `duplicate` |
 | cooldown `suppressed` | — | the winner's, untouched | **commit** — audit `cooldown` |
-| 200 `accepted` | → `done` | compare-and-extend (armed) | **commit** |
-| 200 `already_submitted` / `suppressed` | → `done` | compare-and-delete | **commit** |
+| 200 `accepted`, or `already_submitted` carrying this message's own `run_id` (its earlier accept's response was lost) | → `done` | compare-and-extend (armed) | **commit** |
+| any other 200 `already_submitted` / `suppressed` | → `done` | compare-and-delete | **commit** |
 | 429 `capacity` | `pending` | compare-and-delete | retry + `submit_capacity_backoffs_total` |
 | 5xx / 408 / 401 / 403 / transport / timeout / 200 without a known status | `pending` | compare-and-delete | retry |
 | 400 / 404 / 409 / 422 **with the API's refusal body** `{"status":"rejected"}` | `pending` | compare-and-delete | **commit (skip)** + `submit_rejected_total` + ERROR log |
 | the same statuses without it (a misrouted URL's default 404, generic validation `{errors}` from schema drift), 413, any other 4xx | `pending` | compare-and-delete | retry — fixing the routing/limit recovers; a skip never would |
+| request body unencodable (`NaN`/`Infinity` in `alert`) — nothing sent | `pending` | compare-and-delete | **commit (skip)** + `submit_rejected_total{status="unsendable"}` + ERROR log |
+| unexpected exception inside an attempt | `pending` | compare-and-delete | retry + `pipeline_errors_total` — never committed past |
 | Redis unreachable | gate skipped | gate skipped, **no Redis call** | per response; `gate_flags` say `skipped` |
 
 - **`run_id`** is minted per delivered message (`uuid4`) and reused for every
   retry of it: it is the cooldown ownership token and the submit's trace id.
+  Because it is reused, a retry that finds the cooldown key holding its own
+  `run_id` (an earlier attempt's release, or its claim reply, was lost to a
+  Redis blip) **re-enters** that claim instead of suppressing itself.
 - **Retries happen in the worker**, re-running the whole sequence (exactly what
   a Kafka redelivery would do), with capped exponential backoff + jitter, until
   the message settles, the consumer stops, or its partition is revoked. The poll
@@ -47,9 +52,12 @@ Per message (spec §5.2, `src/bl/pipeline.py`):
   `MAX_UNCOMMITTED_OFFSETS_PER_PARTITION` pauses alone. A polled message that
   cannot be dispatched yet is rewound (seek) and stays outstanding, so no commit
   passes it. Rebalance epochs make a stale worker's late settle a no-op.
-- **Poison** (unparseable message, unexpected exception) is skipped and
-  committed past, counted in `deserialize_errors_total` / `handle_errors_total`
-  — an unsettled poison message would block its partition forever.
+- **Poison** is skipped and committed past, counted in
+  `deserialize_errors_total`: an unparseable message, or one no submit could
+  carry — `tenant_id`/`automation_id` not a non-empty string, `alert` not an
+  object, or no `alert.history_id` (contracts §Matched message). An
+  unsettled poison message would block its partition forever. Exceptions
+  *inside* a submit attempt are not poison: they release the claim and retry.
 - **Redis recovery** follows the C9 breaker: after an outage the gates resume
   within one `REDIS_BREAKER_OPEN_SECONDS` window (a burst arriving during the
   half-open probe still fails open around it).
@@ -58,8 +66,8 @@ Per message (spec §5.2, `src/bl/pipeline.py`):
 |---|---|---|
 | `AUTOMATION_API_URL` | *(required)* | http(s) base URL; startup fails without it, before joining the group |
 | `INTERNAL_SERVICE_TOKEN` | *(empty)* | Sent as `Authorization: Bearer`; empty sets `submit_config_missing{setting="service_token"}` |
-| `AUTOMATION_API_TIMEOUT_SECONDS` / `AUTOMATION_API_CONNECT_TIMEOUT_SECONDS` | `10` / `2` | Clamped to ≤20 / ≤5 — under the 30s provisional cooldown TTL |
-| `SUBMIT_RETRY_BACKOFF_INITIAL_SECONDS` / `SUBMIT_RETRY_BACKOFF_MAX_SECONDS` | `1` / `30` | Retry backoff |
+| `AUTOMATION_API_TIMEOUT_SECONDS` / `AUTOMATION_API_CONNECT_TIMEOUT_SECONDS` | `10` / `2` | Clamped to ≤12 / ≤5 so connect + write + read (httpx times each phase) stays under the 30s provisional cooldown TTL |
+| `SUBMIT_RETRY_BACKOFF_INITIAL_SECONDS` / `SUBMIT_RETRY_BACKOFF_MAX_SECONDS` | `1` / `30` | Retry backoff; initial floored at 0.1s |
 | `KAFKA_COMMIT_INTERVAL_SECONDS` | `1.0` | Async commit cadence |
 | `MAX_UNCOMMITTED_OFFSETS_PER_PARTITION` | `1000` | Per-partition pause threshold |
 
@@ -69,7 +77,7 @@ before the partitions can be assigned elsewhere, so one message is never
 processed by two deliveries at once (a redelivery racing its own still-running
 sibling would lose the cooldown claim to it and be suppressed). The wait is
 bounded by `IN_FLIGHT_DRAIN_TIMEOUT_SECONDS` = connect + 2 × read timeout + 5s
-(27s at the defaults; `revoke_drain_timeouts_total` counts give-ups). Shutdown
+(27s at the defaults, 34s at the caps; `revoke_drain_timeouts_total` counts give-ups). Shutdown
 drains the same work, so set the pod's **`terminationGracePeriodSeconds` ≥ 35**
 (the Kubernetes default of 30 is too short at the defaults).
 
@@ -86,7 +94,8 @@ keep both as they are (spec gap recorded in VAULT, C11 follow-ups).
 |---|---|
 | `..._submits_total{outcome}` | every attempt by classified outcome |
 | `..._submit_capacity_backoffs_total` | 429s — sustained rate means the API's in-flight ceiling is saturated (→ us, spec §9.3) |
-| `..._submit_rejected_total{status}` | **any** increase is an automation that will not run (→ us) |
+| `..._submit_rejected_total{status}` | **any** increase is an automation that will not run (→ us); `status` is the HTTP code or `unsendable` |
+| `..._pipeline_errors_total` | submit attempts that raised unexpectedly (retried) — a bug or library surprise |
 | `..._fail_open_submits_total{reason}` | submits sent without the idempotency gate — the loud Redis-down signal (→ us, spec §9.3) |
 | `..._submit_duration_seconds` | acknowledgement latency |
 | `..._messages_abandoned_total{reason}` | unsettled messages handed back on shutdown/revoke (redelivered, not lost) |
@@ -140,7 +149,10 @@ SET cooldown:{automation_id}:1:{entity_hash} {run_id} NX EX 30
 The entity hash is deterministic: sort the declared fields, encode compact
 Unicode JSON `[field,value]` pairs, then SHA-256. Missing declared fields run
 without a key and carry a warning; an empty field list creates a
-whole-automation key. Losing NX suppresses without refreshing the winner's TTL.
+whole-automation key. Losing NX suppresses without refreshing the winner's TTL —
+unless the key holds this message's own `run_id`: a Lua reclaim re-enters it and
+refreshes the 30s TTL (a vanished key is simply claimed). A failed reclaim fails
+open, since the claim might be our own.
 
 The claim value is an ownership token. `activate()` uses Lua to compare the
 stored value with `run_id` and, on match, atomically rotate it to `done` while

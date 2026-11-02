@@ -646,10 +646,12 @@ def test_commit_exception_does_not_mark_positions_committed():
 
 def test_stop_cancels_in_flight_retries():
     consumer = build_test_consumer()
+    in_flight = consumer._cancel_event((TOPIC, 0), epoch=1)
 
     consumer.stop()
 
     assert consumer._stopping.is_set()
+    assert in_flight.is_set()  # a worker sleeping in backoff wakes now
 
 
 def test_kafka_errors_are_logged_without_reaching_the_pipeline(monkeypatch):
@@ -867,3 +869,53 @@ def test_polling_continues_while_every_worker_is_blocked(monkeypatch):
     assert observed["polls_while_blocked"] >= 25
     assert len(client.requests) == 2
     assert fake.pause_calls  # saturation paused partitions meanwhile
+
+
+
+def test_malformed_message_is_skipped_and_never_submitted(monkeypatch, caplog):
+    client = ScriptedSubmitClient()
+    consumer = build_test_consumer(
+        pipeline=build_test_pipeline(redis=InMemoryRedis(), submit_client=client)
+    )
+    payload = json.loads(json.dumps(CANONICAL_MESSAGE))
+    payload["tenant_id"] = None
+    before = _counter("keep_automation_consumer_deserialize_errors_total")
+
+    with caplog.at_level(logging.ERROR, logger="src.core.kafka_consumer"):
+        fake = _run_loop(
+            consumer, [_FakeMessage(_encode(payload), offset=4)], monkeypatch
+        )
+
+    assert client.requests == []
+    assert fake.committed_position(0) == 5
+    assert _counter("keep_automation_consumer_deserialize_errors_total") == before + 1
+    assert "tenant_id" in caplog.text
+
+
+def test_revoke_recommits_a_position_an_async_commit_may_still_lose():
+    """N1: the async commit was only issued, not confirmed; the revoke must
+    commit synchronously anyway rather than trust it."""
+    tracker = OffsetTracker()
+    consumer = build_test_consumer(offset_tracker=tracker)
+    fake = _FakeKafkaConsumer([], on_exhausted=lambda: None)
+    key = (TOPIC, 0)
+    tracker.settle(key, 0, tracker.track(key, 0))
+    consumer._commit_settled(fake, synchronous=False)
+    assert fake.commits == [({0: 1}, True)]
+
+    consumer._on_revoke(fake, [TopicPartition(TOPIC, 0)])
+
+    assert fake.commits[-1] == ({0: 1}, False)
+
+
+def test_request_level_commit_error_re_offers_every_partition():
+    tracker = OffsetTracker()
+    consumer = build_test_consumer(offset_tracker=tracker)
+    for partition in (0, 1):
+        key = (TOPIC, partition)
+        tracker.settle(key, 0, tracker.track(key, 0))
+    tracker.mark_committed(tracker.commits_due())
+
+    consumer._on_commit("COORDINATOR_NOT_AVAILABLE", [TopicPartition(TOPIC, 0), TopicPartition(TOPIC, 1)])
+
+    assert sorted(tracker.commits_due()) == [((TOPIC, 0), 1), ((TOPIC, 1), 1)]

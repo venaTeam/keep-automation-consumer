@@ -16,6 +16,7 @@ class RedisOperation(str, Enum):
     COOLDOWN_TTL = "cooldown_ttl"
     COOLDOWN_ACTIVATE = "cooldown_activate"
     COOLDOWN_RELEASE = "cooldown_release"
+    COOLDOWN_RECLAIM = "cooldown_reclaim"
 
 
 class GateConfigSetting(str, Enum):
@@ -115,7 +116,7 @@ worker_pool_tasks_in_flight = Gauge(
     "Per-message tasks currently occupying worker slots",
 )
 
-# Messages whose processing raised. The worker guard logs, settles the offset
+# Messages whose processing raised outside the submit pipeline. The worker guard logs, settles the offset
 # (it is committed past — a raising message would otherwise block its
 # partition's contiguous commits forever) and moves on; this counter is the only
 # evidence a message was skipped.
@@ -194,10 +195,19 @@ fail_open_submit_counters = {
 messages_abandoned_counters = {
     reason: messages_abandoned.labels(reason=reason.value) for reason in AbandonReason
 }
+# Label is the refusing HTTP status, or `unsendable` when no request could
+# carry the message at all.
 submit_rejection_counters = {
-    status: submit_rejections.labels(status=str(status))
-    for status in (400, 404, 409, 422)
+    status: submit_rejections.labels(status=status)
+    for status in ("400", "404", "409", "422", "unsendable")
 }
+
+# Unexpected exceptions inside one submit attempt: the claim is released and
+# the attempt retried like a clean API failure — never committed past.
+pipeline_errors = Counter(
+    "keep_automation_consumer_pipeline_errors_total",
+    "Submit attempts that raised unexpectedly (retried, not skipped)",
+)
 service_token_missing = submit_config_missing.labels(setting="service_token")
 
 # -- Offsets (C11) ------------------------------------------------------------

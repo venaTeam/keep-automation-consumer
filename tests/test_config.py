@@ -31,20 +31,25 @@ def test_submit_timeouts_stay_under_the_provisional_cooldown_ttl(monkeypatch):
 
     monkeypatch.setenv("AUTOMATION_API_TIMEOUT_SECONDS", "2000")
     monkeypatch.setenv("AUTOMATION_API_CONNECT_TIMEOUT_SECONDS", "100")
+    monkeypatch.setenv("SUBMIT_RETRY_BACKOFF_INITIAL_SECONDS", "0")
     try:
         importlib.reload(config_module)
         importlib.reload(consts)
 
-        assert consts.AUTOMATION_API_TIMEOUT_SECONDS == 20.0
+        assert consts.AUTOMATION_API_TIMEOUT_SECONDS == 12.0
         assert consts.AUTOMATION_API_CONNECT_TIMEOUT_SECONDS == 5.0
+        # httpx applies the timeout per phase: connect + write + read.
         assert (
             consts.AUTOMATION_API_CONNECT_TIMEOUT_SECONDS
-            + consts.AUTOMATION_API_TIMEOUT_SECONDS
+            + 2 * consts.AUTOMATION_API_TIMEOUT_SECONDS
             < COOLDOWN_PROVISIONAL_TTL_SECONDS
         )
-        assert consts.IN_FLIGHT_DRAIN_TIMEOUT_SECONDS == 50.0
+        assert consts.IN_FLIGHT_DRAIN_TIMEOUT_SECONDS == 34.0
+        # No zero-delay retry storm against a struggling API.
+        assert consts.SUBMIT_RETRY_BACKOFF_INITIAL_SECONDS == 0.1
     finally:
         monkeypatch.delenv("AUTOMATION_API_TIMEOUT_SECONDS")
         monkeypatch.delenv("AUTOMATION_API_CONNECT_TIMEOUT_SECONDS")
+        monkeypatch.delenv("SUBMIT_RETRY_BACKOFF_INITIAL_SECONDS")
         importlib.reload(config_module)
         importlib.reload(consts)

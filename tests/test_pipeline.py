@@ -23,7 +23,7 @@ from src.bl.gates.cooldown_key import (
 from src.bl.gates.idempotency import IdempotencyGate, idempotency_key
 from src.bl.suppression_audit import REASON_COOLDOWN, REASON_DUPLICATE
 from src.config.consts import IDEMPOTENCY_TTL_SECONDS
-from src.models.matched_message import MatchedAlertMessage
+from src.models.matched_message import MalformedMessage, MatchedAlertMessage
 from src.models.submit import SubmitOutcome, SubmitStatus
 from tests.helpers import (
     ACCEPTED,
@@ -365,28 +365,26 @@ def test_redis_unset_submits_without_gates():
     assert client.requests[0].gate_flags["cooldown"] == "skipped"
 
 
-def test_missing_history_id_fails_open_but_cooldown_still_runs():
-    redis = InMemoryRedis()
-    alert = {k: v for k, v in MESSAGE["alert"].items() if k != "history_id"}
-    client = ScriptedSubmitClient(ACCEPTED)
-    pipeline = build_test_pipeline(redis=redis, submit_client=client)
-    before = counter(
-        "keep_automation_consumer_fail_open_submits_total", reason="missing_history_id"
-    )
+@pytest.mark.parametrize(
+    ("overrides", "field"),
+    [
+        ({"tenant_id": None}, "tenant_id"),
+        ({"tenant_id": ""}, "tenant_id"),
+        ({"automation_id": None}, "automation_id"),
+        ({"alert": "not-an-object"}, "alert"),
+        ({"alert": {"site": "x"}}, "alert.history_id"),
+        ({"alert": {"history_id": None}}, "alert.history_id"),
+    ],
+)
+def test_a_message_no_submit_could_carry_is_malformed(overrides, field):
+    """S2: submitting nulls would be refused by the API's request validation
+    on every attempt and stall the partition; it is poison instead."""
+    payload = {**json.loads(json.dumps(MESSAGE)), **overrides}
 
-    pipeline.process_once(message(alert=alert), run_id=RUN_ID)
+    with pytest.raises(MalformedMessage) as excinfo:
+        MatchedAlertMessage.from_bytes(json.dumps(payload).encode())
 
-    flags = client.requests[0].gate_flags
-    assert flags["reason"] == "missing_history_id"
-    assert flags["cooldown"] == "claimed"
-    assert redis.values[COOLDOWN_KEY] == COOLDOWN_ARMED_VALUE
-    assert (
-        counter(
-            "keep_automation_consumer_fail_open_submits_total",
-            reason="missing_history_id",
-        )
-        == before + 1
-    )
+    assert excinfo.value.fields == [field]
 
 
 def test_missing_cooldown_field_runs_with_a_warning_and_arms_nothing():
@@ -557,3 +555,175 @@ def test_redelivery_after_acknowledgement_is_one_submit_and_one_audited_duplicat
     assert (first.outcome, second.outcome) == ("accepted", "duplicate")
     assert len(client.requests) == 1
     assert [row["reason"] for row in auditor.rows] == [REASON_DUPLICATE]
+
+
+# -- review fixes (PR #13 CR) ------------------------------------------------------
+
+
+def test_a_lost_release_does_not_make_the_retry_suppress_itself():
+    """B1/A: attempt 1 fails and its release hits a Redis blip, leaving our own
+    claim behind; the retry must re-enter it, not be suppressed by it."""
+    redis = InMemoryRedis()
+    auditor = RecordingAuditor()
+
+    def blip_the_release(_request):
+        if len(client.requests) == 1:
+            redis.fail_once.add("release")
+
+    client = ScriptedSubmitClient(
+        failure(SubmitOutcome.API_ERROR, 503), ACCEPTED, on_submit=blip_the_release
+    )
+    pipeline = build_test_pipeline(
+        redis=redis, submit_client=client, suppression_auditor=auditor
+    )
+
+    result = pipeline.run(message(), cancelled=threading.Event())
+
+    assert result.outcome == "accepted"
+    assert len(client.requests) == 2
+    assert auditor.rows == []  # never audited as a cooldown suppression
+    assert redis.values[COOLDOWN_KEY] == COOLDOWN_ARMED_VALUE
+
+
+def test_a_lost_claim_reply_does_not_make_the_retry_suppress_itself():
+    """B1/B: the SET NX lands but its reply is lost, so attempt 1 fails open
+    without knowing it owns the key; the retry must re-enter it."""
+
+    class ReplyLostOnce(InMemoryRedis):
+        lost = False
+
+        def set(self, key, value, nx=False, ex=None):
+            applied = super().set(key, value, nx=nx, ex=ex)
+            if key.startswith("cooldown:") and not self.lost:
+                self.lost = True
+                raise TimeoutError("reply lost")
+            return applied
+
+    redis = ReplyLostOnce()
+    auditor = RecordingAuditor()
+    client = ScriptedSubmitClient(failure(SubmitOutcome.TRANSPORT_ERROR), ACCEPTED)
+    pipeline = build_test_pipeline(
+        redis=redis, submit_client=client, suppression_auditor=auditor
+    )
+
+    result = pipeline.run(message(), cancelled=threading.Event())
+
+    assert result.outcome == "accepted"
+    assert auditor.rows == []
+    assert client.requests[1].gate_flags["cooldown"] == "claimed"
+    assert redis.values[COOLDOWN_KEY] == COOLDOWN_ARMED_VALUE
+
+
+def test_own_run_already_submitted_arms_the_cooldown():
+    """S3: attempt 1 was accepted but its response was lost; the retry gets
+    already_submitted with our own run_id — the run happened, so arm."""
+    redis = InMemoryRedis()
+    holder = {}
+
+    def own_run_already_submitted(request):
+        holder["run_id"] = request.run_id
+
+    class OwnRun(ScriptedSubmitClient):
+        def submit(self, request):
+            result = super().submit(request)
+            if len(self.requests) == 2:
+                return acknowledged(SubmitStatus.ALREADY_SUBMITTED, run_id=request.run_id)
+            return result
+
+    client = OwnRun(failure(SubmitOutcome.TRANSPORT_ERROR), on_submit=own_run_already_submitted)
+    pipeline = build_test_pipeline(redis=redis, submit_client=client)
+
+    result = pipeline.run(message(), cancelled=threading.Event())
+
+    assert result.outcome == "already_submitted"
+    assert redis.values[COOLDOWN_KEY] == COOLDOWN_ARMED_VALUE
+    assert redis.ttls[COOLDOWN_KEY] == 300
+
+
+def test_someone_elses_already_submitted_still_releases():
+    redis = InMemoryRedis()
+    pipeline = build_test_pipeline(
+        redis=redis,
+        submit_client=ScriptedSubmitClient(
+            acknowledged(SubmitStatus.ALREADY_SUBMITTED, run_id=OTHER_RUN_ID)
+        ),
+    )
+
+    pipeline.process_once(message(), run_id=RUN_ID)
+
+    assert COOLDOWN_KEY not in redis.values
+
+
+def test_unsendable_message_is_skipped_loudly_and_releases_its_claim(caplog):
+    """S1: NaN inside the alert can never be encoded; skip it as a refusal
+    instead of letting it reach the catch-all or retry forever."""
+    import httpx
+
+    from src.bl.submit_client import HttpSubmitClient
+
+    sent = []
+    client = HttpSubmitClient(
+        base_url="http://api.test",
+        service_token="t",
+        timeout_seconds=5.0,
+        connect_timeout_seconds=1.0,
+        transport=httpx.MockTransport(lambda r: sent.append(r) or httpx.Response(200)),
+    )
+    redis = InMemoryRedis()
+    pipeline = build_test_pipeline(redis=redis, submit_client=client)
+    alert = {**MESSAGE["alert"], "score": float("nan")}
+    before = counter("keep_automation_consumer_submit_rejected_total", status="unsendable")
+
+    with caplog.at_level(logging.ERROR, logger="src.bl.pipeline"):
+        result = pipeline.process_once(message(alert=alert), run_id=RUN_ID)
+
+    assert result.settled is True
+    assert result.outcome == "unsendable"
+    assert sent == []
+    assert COOLDOWN_KEY not in redis.values
+    assert (
+        counter("keep_automation_consumer_submit_rejected_total", status="unsendable")
+        == before + 1
+    )
+    assert "will NOT run" in caplog.text
+
+
+def test_an_attempt_that_raises_releases_its_claim_and_is_retried():
+    """S1: an unexpected exception is never committed past."""
+    redis = InMemoryRedis()
+
+    class FlakyClient(ScriptedSubmitClient):
+        def submit(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                assert redis.values.get(COOLDOWN_KEY) == request.run_id
+                raise RuntimeError("unforeseen library error")
+            return ACCEPTED
+
+    client = FlakyClient()
+    pipeline = build_test_pipeline(redis=redis, submit_client=client)
+    before = counter("keep_automation_consumer_pipeline_errors_total")
+
+    result = pipeline.run(message(), cancelled=threading.Event())
+
+    assert result.outcome == "accepted"
+    assert len(client.requests) == 2
+    assert counter("keep_automation_consumer_pipeline_errors_total") == before + 1
+    assert redis.values[COOLDOWN_KEY] == COOLDOWN_ARMED_VALUE
+
+
+def test_an_attempt_that_raises_never_leaves_its_claim_behind():
+    """Otherwise other events of the same entity would be falsely suppressed
+    for the 30s provisional window with nothing accepted."""
+    redis = InMemoryRedis()
+
+    class Exploding(ScriptedSubmitClient):
+        def submit(self, request):
+            raise RuntimeError("unforeseen library error")
+
+    pipeline = build_test_pipeline(redis=redis, submit_client=Exploding())
+
+    with pytest.raises(RuntimeError):
+        pipeline.process_once(message(), run_id=RUN_ID)
+
+    assert COOLDOWN_KEY not in redis.values
