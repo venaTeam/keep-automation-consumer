@@ -26,7 +26,6 @@ def _client(handler, token="svc-token"):
         service_token=token,
         timeout_seconds=5.0,
         connect_timeout_seconds=1.0,
-        max_connections=4,
         transport=httpx.MockTransport(handler),
     )
 
@@ -167,8 +166,33 @@ def test_untyped_refusal_statuses_are_retried_not_skipped(code, body):
 
 def test_proxy_environment_is_ignored():
     client = _client(lambda request: httpx.Response(200, json={"status": "accepted"}))
+    client.submit(REQUEST)
 
-    assert client._client.trust_env is False
+    assert client._clients[0].trust_env is False
+
+
+def test_each_worker_thread_gets_its_own_client_and_close_closes_all():
+    import threading
+
+    client = _client(lambda request: httpx.Response(200, json={"status": "accepted"}))
+    seen = []
+
+    def submit_twice():
+        client.submit(REQUEST)
+        client.submit(REQUEST)
+        seen.append(client._local.client)
+
+    threads = [threading.Thread(target=submit_twice) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len({id(c) for c in seen}) == 3  # one per thread, reused within it
+    assert len(client._clients) == 3
+    client.close()
+    assert all(c.is_closed for c in seen)
+    assert client._clients == []
 
 
 @pytest.mark.parametrize("code", [500, 502, 503, 504, 408, 401, 403, 307, 201, 413])

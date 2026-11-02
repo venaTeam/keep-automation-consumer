@@ -78,7 +78,6 @@ def pipeline_for(client, api, auditor=None):
         service_token="t",
         timeout_seconds=5.0,
         connect_timeout_seconds=1.0,
-        max_connections=32,
         transport=httpx.MockTransport(api.handler),
     )
     return SubmitPipeline(

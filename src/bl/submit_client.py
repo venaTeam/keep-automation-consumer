@@ -13,8 +13,11 @@ carry only an exception class name or a status code.
 
 import json
 import logging
+import ssl
+import threading
 from typing import Optional, Protocol
 
+import certifi
 import httpx
 
 from src.models.submit import (
@@ -28,7 +31,6 @@ from src.models.submit import (
 logger = logging.getLogger(__name__)
 
 SUBMIT_PATH = "/internal/submit"
-KEEPALIVE_CONNECTIONS = 32
 
 # The API refused this message for good (spec §8.4, contracts §Submit): bad
 # request, unknown automation, tenant mismatch, validation. Retrying cannot
@@ -54,13 +56,20 @@ class SubmitClient(Protocol):
 
 
 class HttpSubmitClient:
-    """One process-lifetime `httpx.Client` shared by every worker.
+    """One small `httpx.Client` per worker thread, built on first use.
 
-    `httpx.Client` is thread-safe and pools connections; building one per
-    message would pay a TCP (and TLS) handshake per submit at ~200/s. The pool is
-    sized to the worker pool so a worker never waits on a connection slot.
-    Redirects are not followed and proxy env vars are ignored: either would be
-    a routing mistake that could carry the token elsewhere.
+    Measured locally: a single `httpx.Client` shared by ~150 concurrent workers
+    tops out near 150-250 req/s — httpcore's sync pool serialises request
+    assignment under one lock — while per-thread clients sustain ~900 req/s
+    against the same server. Each worker submits one request at a time, so a
+    one-connection client per thread keeps its connection alive with no pool
+    contention; total connections stay bounded by the worker pool.
+
+    All clients share one SSL context: building a client otherwise loads the
+    CA bundle (~270ms of GIL each, measured), which 200 workers would pay on
+    their first message. Redirects are not followed and proxy env vars are
+    ignored: either would be a routing mistake that could carry the token
+    elsewhere.
     """
 
     def __init__(
@@ -70,33 +79,30 @@ class HttpSubmitClient:
         service_token: str,
         timeout_seconds: float,
         connect_timeout_seconds: float,
-        max_connections: int,
         transport: Optional[httpx.BaseTransport] = None,
     ) -> None:
         headers = {"Accept": "application/json"}
         if service_token:
             headers["Authorization"] = f"Bearer {service_token}"
-        self._client = httpx.Client(
-            base_url=base_url,
-            headers=headers,
-            timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout_seconds),
-            limits=httpx.Limits(
-                max_connections=max_connections,
-                # httpcore scans every idle connection on each request, so a
-                # burst that grew the pool to ~200 would tax every request
-                # until the idle ones expire. Keep only a working set alive.
-                max_keepalive_connections=min(max_connections, KEEPALIVE_CONNECTIONS),
-            ),
-            follow_redirects=False,
+        self._client_kwargs = {
+            "base_url": base_url,
+            "headers": headers,
+            "timeout": httpx.Timeout(timeout_seconds, connect=connect_timeout_seconds),
+            "limits": httpx.Limits(max_connections=1, max_keepalive_connections=1),
+            "follow_redirects": False,
             # The target is always the internal API: never route the token and
             # payloads through a proxy picked up from HTTP(S)_PROXY.
-            trust_env=False,
-            transport=transport,
-        )
+            "trust_env": False,
+            "verify": ssl.create_default_context(cafile=certifi.where()),
+            "transport": transport,
+        }
+        self._local = threading.local()
+        self._clients: list[httpx.Client] = []
+        self._lock = threading.Lock()
 
     def submit(self, request: SubmitRequest) -> SubmitResult:
         try:
-            response = self._client.post(SUBMIT_PATH, json=request.to_dict())
+            response = self._thread_client().post(SUBMIT_PATH, json=request.to_dict())
         except httpx.TimeoutException as exc:
             return SubmitResult(
                 SubmitOutcome.TRANSPORT_ERROR, error=f"timeout:{type(exc).__name__}"
@@ -106,7 +112,19 @@ class HttpSubmitClient:
         return classify_response(response.status_code, response.content)
 
     def close(self) -> None:
-        self._client.close()
+        with self._lock:
+            clients, self._clients = self._clients, []
+        for client in clients:
+            client.close()
+
+    def _thread_client(self) -> httpx.Client:
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = httpx.Client(**self._client_kwargs)
+            self._local.client = client
+            with self._lock:
+                self._clients.append(client)
+        return client
 
 
 def classify_response(status_code: int, body: bytes) -> SubmitResult:

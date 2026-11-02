@@ -132,7 +132,6 @@ def build_submit_client() -> HttpSubmitClient:
         service_token=INTERNAL_SERVICE_TOKEN,
         timeout_seconds=AUTOMATION_API_TIMEOUT_SECONDS,
         connect_timeout_seconds=AUTOMATION_API_CONNECT_TIMEOUT_SECONDS,
-        max_connections=WORKER_POOL_SIZE,
     )
 
 
