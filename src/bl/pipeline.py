@@ -7,9 +7,9 @@ One attempt is the whole sequence a Kafka redelivery would run:
 | Result | Idem key | `run_id`-owned cooldown claim | Settled (offset commits)? |
 |---|---|---|---|
 | idem `duplicate` | — | not claimed | yes — audit `duplicate` |
-| cooldown `suppressed` | — | the other claimant's, untouched | yes — audit `cooldown` |
-| 200 `accepted`, or `already_submitted` with our own `run_id` | → `done` | compare-and-extend (armed) | yes |
-| any other 200 `already_submitted` / `suppressed` | → `done` | compare-and-delete | yes |
+| cooldown `suppressed` | — | the other event's, untouched | yes — audit `cooldown` |
+| 200 `accepted`, or `already_submitted` with our `run_id` + recent (claim re-entered, or a prior attempt) | → `done` | compare-and-extend (armed) | yes |
+| any other 200 `already_submitted` (stale) / `suppressed` | → `done` | compare-and-delete | yes |
 | 429 `capacity` | stays `pending` | compare-and-delete | no — retry (+ capacity metric) |
 | 5xx / 408 / 401 / 403 / transport / invalid 200 | stays `pending` | compare-and-delete | no — retry |
 | 400 / 404 / 409 / 422 + typed refusal body | stays `pending` | compare-and-delete | yes — skipped, loud |
@@ -27,9 +27,12 @@ the Kafka poll thread never waits (ADR-007: no retry may stall polling past
 semantics exact: the provisional cooldown claim was released on failure, so the
 next attempt has to win it again — or learn that another event now holds it.
 
-The message's `run_id` is minted once per delivered message and reused for every
-attempt: it is the cooldown ownership token and the submit's trace id. On an
-`already_submitted` the API's `run_id` (the existing row's) is authoritative.
+The `run_id` is derived per event — `uuid5` over `automation_id:history_id`
+(contracts §Submit) — so every attempt and every redelivery of one event carries
+the same one: it is the cooldown ownership token and the submit's trace id. A
+redelivery after a crash therefore re-enters the provisional claim its dead
+delivery left instead of being suppressed by it. On an `already_submitted` the
+API's `run_id` (the existing row's) is authoritative.
 """
 
 import logging
@@ -38,7 +41,6 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
-from uuid import uuid4
 
 from src.bl.gates.cooldown import CooldownGate
 from src.bl.gates.idempotency import REASON_REDIS_UNAVAILABLE, IdempotencyGate
@@ -68,7 +70,12 @@ from src.core.metrics import (
 from src.models.cooldown import CooldownDecision, CooldownOutcome
 from src.models.idempotency import IdempotencyOutcome
 from src.models.matched_message import MatchedAlertMessage
-from src.models.submit import SubmitOutcome, SubmitRequest, SubmitResult
+from src.models.submit import (
+    SubmitOutcome,
+    SubmitRequest,
+    SubmitResult,
+    derive_run_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +137,7 @@ class SubmitPipeline:
         so Kafka redelivers it (to this process after a restart, or to the new
         owner after a rebalance) and the idempotent sequence runs again there.
         """
-        run_id = str(uuid4())
+        run_id = derive_run_id(message.automation_id, message.history_id)
         attempt = 0
         while True:
             abandon_reason = self._abandon_reason(cancelled, still_owned)
@@ -139,7 +146,9 @@ class SubmitPipeline:
                 return None
 
             try:
-                result = self.process_once(message, run_id=run_id)
+                result = self.process_once(
+                    message, run_id=run_id, prior_attempt=attempt > 0
+                )
             except Exception:  # noqa: BLE001
                 # A bug or an unforeseen library error: the attempt already
                 # released its claim. Retrying is recoverable once fixed;
@@ -185,8 +194,15 @@ class SubmitPipeline:
     # -- one attempt ------------------------------------------------------------
 
     def process_once(
-        self, message: MatchedAlertMessage, *, run_id: str
+        self,
+        message: MatchedAlertMessage,
+        *,
+        run_id: str,
+        prior_attempt: bool = False,
     ) -> AttemptResult:
+        """One attempt. `prior_attempt`: an earlier attempt of this delivery
+        went unacknowledged — it may have reached the API and been accepted
+        with its response lost, so an `already_submitted` now is recent."""
         idempotency = self._idempotency_gate.claim(message)
         if idempotency.outcome is IdempotencyOutcome.DUPLICATE:
             # A previous delivery of this same event reached an API
@@ -214,6 +230,7 @@ class SubmitPipeline:
             return self._submit_and_settle(
                 message, run_id=run_id, gate_flags=gate_flags,
                 idempotency=idempotency, cooldown=cooldown,
+                prior_attempt=prior_attempt,
             )
         except BaseException:
             # Never leave a provisional claim behind an attempt that blew up:
@@ -230,6 +247,7 @@ class SubmitPipeline:
         gate_flags: dict[str, str],
         idempotency,
         cooldown: CooldownDecision,
+        prior_attempt: bool,
     ) -> AttemptResult:
         if idempotency.outcome is IdempotencyOutcome.FAIL_OPEN:
             self._count_fail_open_submit(idempotency.reason)
@@ -251,12 +269,14 @@ class SubmitPipeline:
             # into an audited duplicate instead of another submit. A failed
             # write costs one extra idempotent submit, never correctness.
             self._idempotency_gate.mark_done(message)
-            if result.outcome is SubmitOutcome.ACCEPTED or _is_own_run(result, run_id):
-                # `already_submitted` carrying our own run_id: an earlier
-                # attempt of this delivery was accepted but its response was
-                # lost — the run did start under this claim, so arm it.
-                self._arm_cooldown(message, cooldown, run_id)
+            if result.outcome is SubmitOutcome.ACCEPTED or _is_recent_own_run(
+                result, run_id, cooldown=cooldown, prior_attempt=prior_attempt
+            ):
+                self._arm_cooldown(message, cooldown, run_id, result)
             else:
+                # `suppressed`, or a stale `already_submitted` (an offset
+                # replay, a copy past the idempotency TTL): arming would restart
+                # the entity's window for a run that may be hours old.
                 self._cooldown_gate.release(cooldown)
             return AttemptResult(settled=True, outcome=result.outcome.value)
 
@@ -281,14 +301,25 @@ class SubmitPipeline:
         return result
 
     def _arm_cooldown(
-        self, message: MatchedAlertMessage, cooldown: CooldownDecision, run_id: str
+        self,
+        message: MatchedAlertMessage,
+        cooldown: CooldownDecision,
+        run_id: str,
+        result: SubmitResult,
     ) -> None:
         armed = self._cooldown_gate.activate(cooldown)
         if cooldown.outcome is CooldownOutcome.CLAIMED and not armed:
-            # The provisional claim expired (or Redis failed) before the
-            # acknowledgement arrived, so this run is not covering its entity.
-            # Best-effort by design: the run itself is durable.
-            logger.warning(
+            # The provisional claim expired, was released by a sibling delivery
+            # of this event, or Redis failed before the acknowledgement arrived,
+            # so this run is not covering its entity. Best-effort by design: the
+            # run itself is durable. On `already_submitted` the usual cause is a
+            # sibling that armed it first — expected, so not a warning.
+            log = (
+                logger.warning
+                if result.outcome is SubmitOutcome.ACCEPTED
+                else logger.debug
+            )
+            log(
                 "automations: accepted run could not arm its cooldown "
                 "(claim no longer owned) tenant_id=%s automation_id=%s run_id=%s",
                 message.tenant_id,
@@ -415,11 +446,26 @@ class SubmitPipeline:
         )
 
 
-def _is_own_run(result: SubmitResult, run_id: str) -> bool:
+def _is_recent_own_run(
+    result: SubmitResult,
+    run_id: str,
+    *,
+    cooldown: CooldownDecision,
+    prior_attempt: bool,
+) -> bool:
+    """`already_submitted` for this event, with evidence the run is recent.
+
+    The run_id is derived per event, so carrying it proves only "this event
+    ran", possibly hours ago. Recent means: this attempt re-entered a claim a
+    delivery of the event held within the provisional TTL (a crash
+    redelivery, a sibling in flight), or an earlier attempt of this delivery
+    reached the API and its response was lost.
+    """
     return (
         result.outcome is SubmitOutcome.ALREADY_SUBMITTED
         and result.response is not None
         and result.response.run_id == run_id
+        and (cooldown.reentered or prior_attempt)
     )
 
 

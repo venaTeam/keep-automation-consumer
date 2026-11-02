@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 
 import pytest
+from prometheus_client import REGISTRY
 
 from src.bl.gates.cooldown import CooldownGate
 from src.bl.gates.cooldown_key import (
@@ -93,7 +94,7 @@ class FakeRedis:
                 current = self.values.get(key)
                 if current == args[0]:
                     self.ttls[key] = int(args[1])
-                    return 1
+                    return 2
                 if current is None:
                     self.values[key] = args[0]
                     self.ttls[key] = int(args[1])
@@ -455,6 +456,53 @@ def test_nx_loss_to_our_own_token_re_enters_and_refreshes_the_claim():
     assert again.owner_token == RUN_ID
     assert redis.values[first.key] == RUN_ID
     assert redis.ttls[first.key] == COOLDOWN_PROVISIONAL_TTL_SECONDS
+
+
+def test_re_entry_is_reported_and_counted_but_a_fresh_claim_is_not():
+    redis = FakeRedis()
+    def reentries():
+        return REGISTRY.get_sample_value(
+            "keep_automation_consumer_cooldown_claims_reentered_total"
+        )
+
+    before = reentries()
+
+    first = gate(redis).claim(message(), run_id=RUN_ID)
+    again = gate(redis).claim(message(), run_id=RUN_ID)
+
+    assert first.reentered is False
+    assert again.reentered is True
+    # Same wire flag: re-entry is a claim, only the metric tells them apart.
+    assert again.gate_flags == {"cooldown": "claimed"}
+    assert reentries() == before + 1
+
+
+def test_key_vanishing_between_nx_and_reclaim_is_a_fresh_claim_not_a_re_entry():
+    class LosesNxToAKeyThatThenExpires(FakeRedis):
+        def set(self, key, value, nx=False, ex=None):
+            super().set(key, value, nx=nx, ex=ex)
+            self.values.pop(key, None)  # the other claim expired right after
+            return None
+
+    redis = LosesNxToAKeyThatThenExpires()
+
+    decision = gate(redis).claim(message(), run_id=RUN_ID)
+
+    assert decision.outcome is CooldownOutcome.CLAIMED
+    assert decision.reentered is False
+    assert redis.values[decision.key] == RUN_ID
+
+
+def test_an_armed_claim_is_never_re_entered():
+    redis = FakeRedis()
+    first = gate(redis).claim(message(), run_id=RUN_ID)
+    assert gate(redis).activate(first) is True
+
+    again = gate(redis).claim(message(), run_id=RUN_ID)
+
+    assert again.outcome is CooldownOutcome.SUPPRESSED
+    assert redis.values[first.key] == COOLDOWN_ARMED_VALUE
+    assert redis.ttls[first.key] == 300
 
 
 def test_nx_loss_to_another_token_still_suppresses_untouched():

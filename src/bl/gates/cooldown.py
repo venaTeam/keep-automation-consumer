@@ -20,12 +20,15 @@ from src.bl.gates.cooldown_key import (
     cooldown_key,
 )
 from src.bl.gates.cooldown_redis import (
+    RECLAIM_LOST,
+    RECLAIM_REENTERED,
     CooldownRedisLifecycle,
     RedisCooldownClient,
 )
 from src.config.consts import REDIS_ERROR_LOG_INTERVAL_SECONDS
 from src.core.metrics import (
     RedisOperation,
+    cooldown_claims_reentered,
     cooldown_decision_counters,
     redis_error_counters,
 )
@@ -134,18 +137,23 @@ class CooldownGate:
                 reason=REASON_REDIS_UNAVAILABLE,
             )
 
+        reentered = False
         if not claimed:
-            # The run_id is reused across this delivery's retries, so a key
-            # holding it is our own earlier claim whose release (or claim
-            # reply) was lost to a Redis blip. Suppressing on it would make the
-            # message suppress itself and be committed with nothing submitted.
+            # The run_id is derived per event, so a key holding it was claimed
+            # by a delivery of this same event: an earlier attempt whose
+            # release (or claim reply) was lost to a Redis blip, a delivery
+            # killed mid-submit, or a sibling still in flight. Suppressing on it
+            # would make the event suppress itself and be committed with
+            # nothing submitted.
             try:
-                claimed = self._lifecycle.reclaim(
+                reclaimed = self._lifecycle.reclaim(
                     client,
                     key=key,
                     owner_token=run_id,
                     ttl_seconds=COOLDOWN_PROVISIONAL_TTL_SECONDS,
                 )
+                claimed = reclaimed != RECLAIM_LOST
+                reentered = reclaimed == RECLAIM_REENTERED
             except Exception:  # noqa: BLE001 - unsure whose claim it is: run
                 self._redis_failed(RedisOperation.COOLDOWN_RECLAIM)
                 return self._decide(
@@ -157,12 +165,15 @@ class CooldownGate:
                 )
 
         if claimed:
+            if reentered:
+                cooldown_claims_reentered.inc()
             return self._decide(
                 CooldownOutcome.CLAIMED,
                 key=key,
                 entity_hash=entity_hash,
                 cooldown_seconds=seconds,
                 owner_token=run_id,
+                reentered=reentered,
             )
 
         # Losing NX is itself authoritative for this best-effort gate.  TTL is
@@ -321,6 +332,7 @@ class CooldownGate:
         next_eligible_at: Optional[datetime] = None,
         missing_fields: tuple[str, ...] = (),
         reason: Optional[str] = None,
+        reentered: bool = False,
     ) -> CooldownDecision:
         cooldown_decision_counters[outcome].inc()
         flags = {"cooldown": "skipped" if reason else outcome.value}
@@ -336,6 +348,7 @@ class CooldownGate:
             owner_token=owner_token,
             eligible_again_in_seconds=eligible_again_in_seconds,
             next_eligible_at=next_eligible_at,
+            reentered=reentered,
             missing_fields=missing_fields,
             gate_flags=flags,
         )
