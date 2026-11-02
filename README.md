@@ -14,6 +14,17 @@ offset only after an API-confirmed submit.
 
 ## Idempotency gate (C9)
 
+B5 publishes the event identity as `alert.id`. The message model exposes that
+value through the existing `history_id` property used by the gate and audit
+interface, so the Redis key is effectively `idem:{alert.id}:{automation_id}`.
+The consumer reads only `alert.id`; the full alert snapshot is preserved unchanged.
+API/database field names and the gate decision rules are unchanged.
+
+`id` is the canonical B5 wire name; `history_id` is the internal/API name for
+the same alert identity. The producer must preserve it on replay and assign a
+different value to each new occurrence. See `tests/fixtures/README.md` for the
+producer-generated golden payload and the scope of the consumer replay tests.
+
 `SET idem:{history_id}:{automation_id} "pending" NX EX 24h` per message
 (`automation-contracts.md` §Redis keys, spec §5.2 step 1):
 
@@ -51,6 +62,8 @@ The entity hash is deterministic: sort the declared fields, encode compact
 Unicode JSON `[field,value]` pairs, then SHA-256. Missing declared fields run
 without a key and carry a warning; an empty field list creates a
 whole-automation key. Losing NX suppresses without refreshing the winner's TTL.
+The event identity field (`id`) is rejected:
+distinct occurrences of the same entity must share its cooldown key.
 
 The claim value is an ownership token. `activate()` uses Lua to compare the
 stored value with `run_id` and, on match, atomically rotate it to `done` while
@@ -77,6 +90,7 @@ means "not scraped":
 | Metric | |
 |---|---|
 | `..._idempotency_decisions_total{outcome}` | `claimed` / `duplicate` / `ambiguous` / `fail_open`. **Ungated volume is this metric's `fail_open`, not `redis_errors`** — once the breaker is open no Redis call is attempted, so the error counter stops scaling with traffic |
+| `..._idempotency_fail_open_total{reason}` | Every skipped idempotency gate, split into `missing_history_id` (missing B5 `id`) and `redis_unavailable` (including open circuit breaker). Existing outcome series and audit reason tokens remain compatible. Missing-ID warnings share a thread-safe budget per gate, using `REDIS_ERROR_LOG_INTERVAL_SECONDS`, independent of Redis-error warnings. |
 | `..._cooldown_decisions_total{outcome}` | `disabled` / `claimed` / `suppressed` / `missing_field` / `fail_open` |
 | `..._redis_errors_total{operation}` | the Redis-down signal (`claim` / `get` / `mark_done` plus cooldown claim/TTL/activate/release) |
 | `..._gates_config_missing{setting}` | set at startup. `redis_url` = no URL configured; `redis_client` = URL set but the client could not be built (for example, a typo'd scheme) |
