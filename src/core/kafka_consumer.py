@@ -17,6 +17,13 @@ independent of how long submits or their retries take (ADR-007).
 Backpressure: when every worker is busy, all assigned partitions pause; when one
 partition's uncommitted window is full (a stuck message with many settled ones
 behind it), only that partition pauses. Polling continues throughout.
+
+Revoke drains: before a revoked partition's offsets are committed, its in-flight
+workers are woken (backoff sleeps end) and waited for, bounded by
+`IN_FLIGHT_DRAIN_TIMEOUT_SECONDS`. Without this the next owner re-reads a message
+while the old worker still holds its provisional cooldown claim; the redelivery
+would lose NX to its own sibling, be audited as a cooldown suppression and
+committed — and if the old submit then failed, the automation never ran.
 """
 from __future__ import annotations
 
@@ -28,6 +35,8 @@ from typing import TYPE_CHECKING, Callable, Iterable, Optional
 
 from src.bl.pipeline import SubmitPipeline
 from src.config.consts import (
+    IN_FLIGHT_DRAIN_TIMEOUT_SECONDS,
+    WORKER_POOL_SIZE,
     KAFKA_AUTO_OFFSET_RESET,
     KAFKA_BACKPRESSURE_POLL_TIMEOUT_SECONDS,
     KAFKA_BOOTSTRAP_SERVERS,
@@ -45,6 +54,7 @@ from src.core.metrics import (
     offset_commit_errors,
     offsets_committed,
     partitions_paused_uncommitted,
+    revoke_drain_timeouts,
     worker_pool_saturated,
     worker_pool_saturation_events,
 )
@@ -70,6 +80,10 @@ def build_consumer_config() -> dict[str, object]:
         "enable.auto.commit": False,
         "auto.offset.reset": KAFKA_AUTO_OFFSET_RESET,
     }
+
+
+# Saturation ends when in-flight work drops to this (90% of the pool).
+RESUME_BELOW_IN_FLIGHT = WORKER_POOL_SIZE - max(1, WORKER_POOL_SIZE // 10)
 
 
 def _key(partition: TopicPartition) -> PartitionKey:
@@ -99,6 +113,14 @@ class MatchedAlertConsumer:
         # Set by rebalance callbacks: re-apply pause/resume to every assigned
         # partition, since a fresh assignment's pause state is not ours.
         self._reconcile_all = True
+        # Per-partition in-flight work, so a revoke can drain it, and a cancel
+        # event per partition epoch that wakes its workers' backoff sleeps.
+        self._inflight: dict[PartitionKey, int] = {}
+        self._inflight_cv = threading.Condition()
+        self._cancel_events: dict[PartitionKey, tuple[int, threading.Event]] = {}
+        # Partitions inside `_on_revoke`: their workers must stop retrying even
+        # though the tracker still owns them until the revoke commit.
+        self._revoking: set[PartitionKey] = set()
 
     def _create_consumer(self) -> Consumer:
         # Imported lazily so config/tests don't require a broker or librdkafka.
@@ -119,8 +141,12 @@ class MatchedAlertConsumer:
             )
             self._running = True
 
-            signal.signal(signal.SIGINT, lambda *_: self.stop())
-            signal.signal(signal.SIGTERM, lambda *_: self.stop())
+            # Flags only: a handler that set a worker's cancel Event could
+            # deadlock against that Event's own lock if the signal landed while
+            # this thread was inside `_cancel`. The loop exits within one poll
+            # timeout and `finally` wakes the workers.
+            signal.signal(signal.SIGINT, lambda *_: self._request_stop())
+            signal.signal(signal.SIGTERM, lambda *_: self._request_stop())
 
             logger.info(
                 "Consuming topic=%s group=%s (auto-commit OFF)",
@@ -150,6 +176,7 @@ class MatchedAlertConsumer:
             # them first means the final commit sees every settled offset, and
             # no commit ever runs through a closed client.
             self._stopping.set()
+            self._cancel_all()
             worker_pool_saturated.set(0)
             partitions_paused_uncommitted.set(0)
             self._worker_pool.shutdown(wait=True)
@@ -159,6 +186,14 @@ class MatchedAlertConsumer:
                 logger.info("Consumer closed")
 
     def stop(self) -> None:
+        """Stop consuming and wake workers sleeping in a retry backoff.
+
+        Not for signal handlers (see `start`): those use `_request_stop`.
+        """
+        self._request_stop()
+        self._cancel_all()
+
+    def _request_stop(self) -> None:
         self._running = False
         self._stopping.set()
 
@@ -171,9 +206,13 @@ class MatchedAlertConsumer:
             self._rewind(consumer, key, offset)
             return
         epoch = self._tracker.track(key, offset)
+        cancelled = self._cancel_event(key, epoch)
+        with self._inflight_cv:
+            self._inflight[key] = self._inflight.get(key, 0) + 1
         if not self._worker_pool.try_submit(
-            self._handle_safely, msg.value(), key, offset, epoch
+            self._handle_safely, msg.value(), key, offset, epoch, cancelled
         ):
+            self._finish_inflight(key)
             # Only this poll thread submits work, so capacity cannot be
             # consumed between `has_capacity` and `try_submit`. Failing here
             # indicates a pool lifecycle bug. Exit with the offset uncommitted
@@ -195,12 +234,21 @@ class MatchedAlertConsumer:
         consumer.seek(TopicPartition(key[0], key[1], offset))
 
     def _handle_safely(
-        self, raw: bytes, key: PartitionKey, offset: int, epoch: int
+        self,
+        raw: bytes,
+        key: PartitionKey,
+        offset: int,
+        epoch: int,
+        cancelled: threading.Event,
     ) -> None:
         settled = True
         try:
             settled = self._handle(
-                raw, still_owned=lambda: self._tracker.owns(key, epoch)
+                raw,
+                cancelled=cancelled,
+                still_owned=lambda: (
+                    key not in self._revoking and self._tracker.owns(key, epoch)
+                ),
             )
         except Exception:  # noqa: BLE001
             # One bad message must not kill a worker or wedge its partition:
@@ -208,11 +256,19 @@ class MatchedAlertConsumer:
             # every later offset forever. Skipped and counted instead.
             handle_errors.inc()
             logger.exception("Unhandled error processing a matched message; skipping it")
-        if settled:
-            self._tracker.settle(key, offset, epoch)
+        finally:
+            # Settle before leaving the in-flight count, so a revoke drain that
+            # wakes on the count sees this offset settled and commits it.
+            if settled:
+                self._tracker.settle(key, offset, epoch)
+            self._finish_inflight(key)
 
     def _handle(
-        self, raw: bytes, *, still_owned: Callable[[], bool] = lambda: True
+        self,
+        raw: bytes,
+        *,
+        cancelled: Optional[threading.Event] = None,
+        still_owned: Callable[[], bool] = lambda: True,
     ) -> bool:
         """Process one message. True when settled (its offset may commit)."""
         try:
@@ -226,15 +282,76 @@ class MatchedAlertConsumer:
 
         messages_consumed.inc()
         result = self._pipeline.run(
-            message, cancelled=self._stopping, still_owned=still_owned
+            message,
+            cancelled=cancelled if cancelled is not None else self._stopping,
+            still_owned=still_owned,
         )
         return result is not None
+
+    # -- in-flight work per partition ---------------------------------------------
+
+    def _cancel_event(self, key: PartitionKey, epoch: int) -> threading.Event:
+        current = self._cancel_events.get(key)
+        if current is None or current[0] != epoch:
+            current = (epoch, threading.Event())
+            self._cancel_events[key] = current
+        return current[1]
+
+    def _cancel(self, keys: Iterable[PartitionKey]) -> None:
+        for key in keys:
+            current = self._cancel_events.pop(key, None)
+            if current is not None:
+                current[1].set()
+
+    def _cancel_all(self) -> None:
+        self._cancel(list(self._cancel_events))
+
+    def _finish_inflight(self, key: PartitionKey) -> None:
+        with self._inflight_cv:
+            remaining = self._inflight.get(key, 0) - 1
+            if remaining > 0:
+                self._inflight[key] = remaining
+            else:
+                self._inflight.pop(key, None)
+            self._inflight_cv.notify_all()
+
+    def _drain(self, keys: list[PartitionKey]) -> None:
+        """Wait for in-flight work on `keys`, bounded.
+
+        Workers backing off have already been woken (`_cancel`); what remains
+        is at most one HTTP attempt each, bounded by the submit timeouts. The
+        poll thread blocks here inside the rebalance callback — heartbeats run
+        on librdkafka's own thread, and the bound sits far below
+        `max.poll.interval.ms`.
+        """
+        deadline = time.monotonic() + IN_FLIGHT_DRAIN_TIMEOUT_SECONDS
+        with self._inflight_cv:
+            while any(self._inflight.get(key, 0) for key in keys):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    revoke_drain_timeouts.inc()
+                    logger.warning(
+                        "Revoke drain timed out after %.0fs with work still in "
+                        "flight; its messages will be redelivered to the next owner",
+                        IN_FLIGHT_DRAIN_TIMEOUT_SECONDS,
+                    )
+                    return
+                self._inflight_cv.wait(remaining)
 
     # -- backpressure -----------------------------------------------------------
 
     def _apply_backpressure(self, consumer: Consumer) -> None:
         assigned = {_key(tp): tp for tp in consumer.assignment()}
         saturated = not self._worker_pool.has_capacity()
+        if self._saturated and not saturated:
+            # Hysteresis: resume only once a tenth of the pool is free. Resuming
+            # on the first free slot would refill the pool at once and re-pause
+            # every iteration; each pause discards librdkafka's prefetched
+            # data, so the flip-flop refetches up to a fetch size per partition
+            # several times a second.
+            with self._inflight_cv:
+                in_flight = sum(self._inflight.values())
+            saturated = in_flight > RESUME_BELOW_IN_FLIGHT
         if saturated != self._saturated:
             self._report_saturation(saturated)
             self._saturated = saturated
@@ -316,7 +433,7 @@ class MatchedAlertConsumer:
             for (topic, partition), position in due
         ]
         try:
-            consumer.commit(offsets=offsets, asynchronous=not synchronous)
+            result = consumer.commit(offsets=offsets, asynchronous=not synchronous)
         except KafkaException as exc:
             offset_commit_errors.inc(len(due))
             logger.warning(
@@ -325,8 +442,19 @@ class MatchedAlertConsumer:
                 exc,
             )
             return
-        self._tracker.mark_committed(due)
-        offsets_committed.inc(len(due))
+        committed = due
+        if synchronous and result:
+            # A synchronous commit raises only for a request-level error;
+            # per-partition failures come back on the returned list.
+            failed = {_key(tp) for tp in result if tp.error is not None}
+            if failed:
+                offset_commit_errors.inc(len(failed))
+                logger.warning(
+                    "Offset commit failed for %s partition(s) (sync)", len(failed)
+                )
+                committed = [(key, position) for key, position in due if key not in failed]
+        self._tracker.mark_committed(committed)
+        offsets_committed.inc(len(committed))
 
     def _on_commit(self, err, partitions: list[TopicPartition]) -> None:
         failed = (
@@ -353,11 +481,16 @@ class MatchedAlertConsumer:
         logger.info("Assigned %s partition(s)", len(partitions))
 
     def _on_revoke(self, consumer: Consumer, partitions: list[TopicPartition]) -> None:
-        # Commit what is settled while this consumer still owns the partitions;
-        # anything unsettled is redelivered to the new owner. Workers still
-        # holding revoked messages stop retrying (`still_owned` turns False)
-        # and their late settles are ignored (epoch mismatch).
+        # Stop retries, drain in-flight work, then commit what settled — all
+        # while this consumer still owns the partitions. The next owner cannot
+        # receive them until this callback returns, so no message is ever
+        # processed by two deliveries at once. Anything unsettled (abandoned,
+        # or still running past the drain bound) is redelivered to the new
+        # owner, and a late settle from the old epoch is ignored.
         keys = [_key(tp) for tp in partitions]
+        self._revoking.update(keys)
+        self._cancel(keys)
+        self._drain(keys)
         self._commit_settled(consumer, synchronous=True, keys=keys)
         self._forget(keys)
         logger.info("Revoked %s partition(s)", len(partitions))
@@ -366,6 +499,7 @@ class MatchedAlertConsumer:
         # Ownership is already gone: committing now could overwrite the new
         # owner's progress. Drop state only.
         keys = [_key(tp) for tp in partitions]
+        self._cancel(keys)
         self._forget(keys)
         logger.warning("Lost %s partition(s) without a clean revoke", len(partitions))
 
@@ -373,4 +507,5 @@ class MatchedAlertConsumer:
         self._tracker.revoke(keys)
         self._paused.difference_update(keys)
         self._window_paused.difference_update(keys)
+        self._revoking.difference_update(keys)
         self._reconcile_all = True

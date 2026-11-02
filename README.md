@@ -24,8 +24,8 @@ Per message (spec §5.2, `src/bl/pipeline.py`):
 | 200 `already_submitted` / `suppressed` | → `done` | compare-and-delete | **commit** |
 | 429 `capacity` | `pending` | compare-and-delete | retry + `submit_capacity_backoffs_total` |
 | 5xx / 408 / 401 / 403 / transport / timeout / 200 without a known status | `pending` | compare-and-delete | retry |
-| 400 / 404 / 409 / 422 **with the API's typed refusal body** | `pending` | compare-and-delete | **commit (skip)** + `submit_rejected_total` + ERROR log |
-| the same statuses without it (a misrouted URL's default 404), 413, any other 4xx | `pending` | compare-and-delete | retry — fixing the routing/limit recovers; a skip never would |
+| 400 / 404 / 409 / 422 **with the API's refusal body** `{"status":"rejected"}` | `pending` | compare-and-delete | **commit (skip)** + `submit_rejected_total` + ERROR log |
+| the same statuses without it (a misrouted URL's default 404, generic validation `{errors}` from schema drift), 413, any other 4xx | `pending` | compare-and-delete | retry — fixing the routing/limit recovers; a skip never would |
 | Redis unreachable | gate skipped | gate skipped, **no Redis call** | per response; `gate_flags` say `skipped` |
 
 - **`run_id`** is minted per delivered message (`uuid4`) and reused for every
@@ -63,6 +63,16 @@ Per message (spec §5.2, `src/bl/pipeline.py`):
 | `KAFKA_COMMIT_INTERVAL_SECONDS` | `1.0` | Async commit cadence |
 | `MAX_UNCOMMITTED_OFFSETS_PER_PARTITION` | `1000` | Per-partition pause threshold |
 
+**Revoke + shutdown drain.** A revoke wakes its partitions' workers (backoff
+sleeps end), waits for their in-flight attempt, then commits what settled —
+before the partitions can be assigned elsewhere, so one message is never
+processed by two deliveries at once (a redelivery racing its own still-running
+sibling would lose the cooldown claim to it and be suppressed). The wait is
+bounded by `IN_FLIGHT_DRAIN_TIMEOUT_SECONDS` = connect + 2 × read timeout + 5s
+(27s at the defaults; `revoke_drain_timeouts_total` counts give-ups). Shutdown
+drains the same work, so set the pod's **`terminationGracePeriodSeconds` ≥ 35**
+(the Kubernetes default of 30 is too short at the defaults).
+
 | Metric | |
 |---|---|
 | `..._submits_total{outcome}` | every attempt by classified outcome |
@@ -74,6 +84,7 @@ Per message (spec §5.2, `src/bl/pipeline.py`):
 | `..._offset_commits_total` / `..._offset_commit_errors_total` | commits issued / failed (failed ones are re-offered) |
 | `..._partitions_paused_uncommitted_window` | partitions paused behind a stuck message |
 | `..._messages_rewound_total` | polled messages handed back to the fetcher |
+| `..._revoke_drain_timeouts_total` | revokes that stopped waiting for in-flight submits |
 | `..._submit_config_missing{setting}` | startup config gaps |
 
 Suggested alert expressions for I34 (routing is I34's):

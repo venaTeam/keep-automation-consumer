@@ -28,6 +28,7 @@ from src.models.submit import (
 logger = logging.getLogger(__name__)
 
 SUBMIT_PATH = "/internal/submit"
+KEEPALIVE_CONNECTIONS = 32
 
 # The API refused this message for good (spec §8.4, contracts §Submit): bad
 # request, unknown automation, tenant mismatch, validation. Retrying cannot
@@ -81,7 +82,10 @@ class HttpSubmitClient:
             timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout_seconds),
             limits=httpx.Limits(
                 max_connections=max_connections,
-                max_keepalive_connections=max_connections,
+                # httpcore scans every idle connection on each request, so a
+                # burst that grew the pool to ~200 would tax every request
+                # until the idle ones expire. Keep only a working set alive.
+                max_keepalive_connections=min(max_connections, KEEPALIVE_CONNECTIONS),
             ),
             follow_redirects=False,
             # The target is always the internal API: never route the token and
@@ -137,29 +141,21 @@ def classify_response(status_code: int, body: bytes) -> SubmitResult:
 
 
 def _is_refusal_body(body: bytes) -> bool:
-    """Whether a 4xx body is the submit endpoint's own typed refusal.
+    """Whether a 4xx body is the submit endpoint's deliberate refusal.
 
     A skip commits past the message for good, so the status code alone is not
     enough: a misrouted `AUTOMATION_API_URL` (the gateway, a wrong path prefix,
     an image without the route) answers *every* message with a framework
-    default like `404 {"detail": "Not Found"}`, and treating that as a refusal
-    would drain the topic. Only the contract's refusal shapes count —
-    `{"status": "rejected", ...}` or the validation `{"errors": [{code...}]}`.
+    default like `404 {"detail": "Not Found"}`, and consumer↔API schema drift
+    answers every message with the generic validation `422 {"errors": [...]}`.
+    Treating either as a refusal would drain the topic. Only the contract's
+    `{"status": "rejected", ...}` — a per-message verdict — counts.
     """
     try:
         data = json.loads(body)
     except (TypeError, ValueError):
         return False
-    if not isinstance(data, dict):
-        return False
-    if data.get("status") == REFUSAL_STATUS:
-        return True
-    errors = data.get("errors")
-    return (
-        isinstance(errors, list)
-        and bool(errors)
-        and all(isinstance(error, dict) and "code" in error for error in errors)
-    )
+    return isinstance(data, dict) and data.get("status") == REFUSAL_STATUS
 
 
 def _parse_acknowledgement(body: bytes) -> Optional[SubmitResponse]:

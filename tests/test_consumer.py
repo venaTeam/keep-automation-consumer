@@ -3,6 +3,8 @@ backpressure, contiguous commits, rebalance, shutdown)."""
 import json
 import logging
 import signal
+import threading
+import time
 
 import pytest
 from confluent_kafka import KafkaException, TopicPartition
@@ -11,9 +13,11 @@ from prometheus_client import REGISTRY
 import src.core.kafka_consumer as kafka_consumer_module
 from src.core.kafka_consumer import build_consumer_config
 from src.core.offset_tracker import OffsetTracker
+from src.core.worker_pool import BoundedWorkerPool
 from src.models.matched_message import MatchedAlertMessage
 from src.models.submit import SubmitOutcome
 from tests.helpers import (
+    ACCEPTED,
     InMemoryRedis,
     ScriptedSubmitClient,
     build_test_consumer,
@@ -180,12 +184,18 @@ class _FakeKafkaConsumer:
         self.seeks = []
         self.commits = []
         self.closed = False
+        self.polls = 0
 
     def subscribe(self, topics, on_assign=None, on_revoke=None, on_lost=None):
         self.subscribed = topics
         self.callbacks = {"assign": on_assign, "revoke": on_revoke, "lost": on_lost}
 
     def poll(self, _timeout):
+        self.polls += 1
+        if self.polls > 20_000:
+            # A message held back by a pause that never lifts would otherwise
+            # spin here forever; fail the test instead of hanging the suite.
+            raise AssertionError("poll budget exhausted: a partition never resumed")
         if not self._script:
             self._on_exhausted()
             return None
@@ -232,6 +242,18 @@ class _FakeKafkaConsumer:
         self._assignment = [
             tp for tp in self._assignment if tp.partition not in partitions
         ]
+
+    def lose(self, *partitions):
+        tps = [TopicPartition(TOPIC, p) for p in partitions]
+        self.callbacks["lost"](self, tps)
+        self._assignment = [
+            tp for tp in self._assignment if tp.partition not in partitions
+        ]
+
+    def assign(self, *partitions):
+        tps = [TopicPartition(TOPIC, p) for p in partitions]
+        self._assignment.extend(tps)
+        self.callbacks["assign"](self, tps)
 
     def close(self):
         self.closed = True
@@ -502,7 +524,8 @@ def test_message_polled_while_paused_is_rewound_and_never_committed_past(monkeyp
     fake = _run_loop(consumer, [_message(9)], monkeypatch, ignore_pause=True)
 
     assert fake.seeks == [(0, 9)]
-    assert fake.committed_position(0) in (None, 9)
+    # Tracked as outstanding: the final commit is exactly at it, never past.
+    assert fake.committed_position(0) == 9
     assert _counter("keep_automation_consumer_messages_rewound_total") == before + 1
 
 
@@ -539,6 +562,9 @@ def test_full_uncommitted_window_pauses_only_that_partition(monkeypatch):
 
 
 def test_revoke_commits_settled_offsets_and_stops_stale_work(monkeypatch):
+    # Task 1 never runs during the revoke, so the drain gives up at its bound.
+    monkeypatch.setattr(kafka_consumer_module, "IN_FLIGHT_DRAIN_TIMEOUT_SECONDS", 0.05)
+    timeouts_before = _counter("keep_automation_consumer_revoke_drain_timeouts_total")
     pool = _DeferredWorkerPool()
     client = ScriptedSubmitClient()
     consumer = build_test_consumer(
@@ -561,6 +587,10 @@ def test_revoke_commits_settled_offsets_and_stops_stale_work(monkeypatch):
     sync_commits = [c for c, asynchronous in fake.commits if not asynchronous]
     assert {0: 1} in sync_commits
     assert len(client.requests) == 1  # only the message settled before revoke
+    assert (
+        _counter("keep_automation_consumer_revoke_drain_timeouts_total")
+        == timeouts_before + 1
+    )
     assert (
         _counter("keep_automation_consumer_messages_abandoned_total", reason="revoked")
         == before + 1
@@ -630,3 +660,210 @@ def test_kafka_errors_are_logged_without_reaching_the_pipeline(monkeypatch):
     _run_loop(consumer, [_FakeMessage(error="broker went away")], monkeypatch)
 
     assert handled == []
+
+
+def test_message_of_a_window_paused_partition_is_rewound_not_dispatched(monkeypatch):
+    """librdkafka can hand back a prefetched message of a partition we just
+    paused; dispatching it would let the window cap bound nothing."""
+    monkeypatch.setattr(
+        kafka_consumer_module, "MAX_UNCOMMITTED_OFFSETS_PER_PARTITION", 2
+    )
+    pool = _DeferredWorkerPool()
+    consumer = _accepting_consumer(worker_pool=pool)
+
+    script = [
+        _message(0),  # task 0: stuck
+        _message(1),
+        lambda fake: pool.run(1),
+        None,  # a loop iteration pauses p0 (window 2 >= 2)
+        _message(2),  # delivered anyway (prefetched)
+    ]
+    fake = _run_loop(consumer, script, monkeypatch, ignore_pause=True)
+
+    assert fake.seeks == [(0, 2)]
+    assert len(pool.tasks) == 2  # offset 2 was never dispatched
+    assert fake.committed_position(0) in (None, 0)
+
+
+def test_revoke_waits_for_an_in_flight_submit_and_commits_it(monkeypatch):
+    """B1: the next owner must not re-read a message whose submit is still
+    running here, or the redelivery loses the cooldown claim to its sibling."""
+    release = threading.Event()
+    started = threading.Event()
+
+    def block(_request):
+        started.set()
+        release.wait(5)
+
+    client = ScriptedSubmitClient(ACCEPTED, on_submit=block)
+    consumer = build_test_consumer(
+        pipeline=build_test_pipeline(redis=InMemoryRedis(), submit_client=client),
+        worker_pool=BoundedWorkerPool(4),
+    )
+    order = []
+
+    def revoke_mid_submit(fake):
+        assert started.wait(5)
+        threading.Timer(0.2, lambda: (order.append("submit_released"), release.set())).start()
+        fake.revoke(0)
+        order.append("revoke_returned")
+
+    fake = _run_loop(consumer, [_message(0), revoke_mid_submit], monkeypatch)
+
+    assert order == ["submit_released", "revoke_returned"]
+    assert {0: 1} in [c for c, asynchronous in fake.commits if not asynchronous]
+    assert len(client.requests) == 1
+
+
+def test_revoke_wakes_a_worker_sleeping_in_backoff(monkeypatch):
+    attempted = threading.Event()
+
+    client = ScriptedSubmitClient(
+        failure(SubmitOutcome.API_ERROR, 503), on_submit=lambda _r: attempted.set()
+    )
+    pipeline = build_test_pipeline(
+        redis=InMemoryRedis(),
+        submit_client=client,
+        backoff_initial_seconds=60.0,
+        backoff_max_seconds=60.0,
+    )
+    consumer = build_test_consumer(pipeline=pipeline, worker_pool=BoundedWorkerPool(4))
+    before = _counter(
+        "keep_automation_consumer_messages_abandoned_total", reason="revoked"
+    )
+    elapsed = {}
+
+    def revoke_during_backoff(fake):
+        assert attempted.wait(5)
+        time.sleep(0.1)  # the worker is now in its 30-60s backoff
+        started = time.monotonic()
+        fake.revoke(0)
+        elapsed["revoke"] = time.monotonic() - started
+        # The revoke returned only after the woken worker left the pool.
+        elapsed["in_flight_after"] = dict(consumer._inflight)
+
+    fake = _run_loop(consumer, [_message(0), revoke_during_backoff], monkeypatch)
+
+    assert elapsed["revoke"] < 2.0
+    assert elapsed["in_flight_after"] == {}
+    assert len(client.requests) == 1
+    assert fake.committed_position(0) in (None, 0)  # unsettled: redelivered
+    assert (
+        _counter("keep_automation_consumer_messages_abandoned_total", reason="revoked")
+        == before + 1
+    )
+
+
+def test_late_settle_from_a_revoked_epoch_cannot_move_the_new_assignment():
+    """A worker whose drain timed out finishes after the partition came back:
+    its settle must not commit past the redelivered copy."""
+    tracker = OffsetTracker()
+    fake = _FakeKafkaConsumer([], on_exhausted=lambda: None)
+    key = (TOPIC, 0)
+    holder = {}
+
+    def revoke_and_reassign_mid_submit(_request):
+        kafka_consumer_module.IN_FLIGHT_DRAIN_TIMEOUT_SECONDS = 0.05
+        consumer._on_revoke(fake, [TopicPartition(TOPIC, 0)])
+        consumer._on_assign(fake, [TopicPartition(TOPIC, 0)])
+        holder["new_epoch"] = tracker.track(key, 0)  # redelivered copy
+
+    client = ScriptedSubmitClient(ACCEPTED, on_submit=revoke_and_reassign_mid_submit)
+    consumer = build_test_consumer(
+        pipeline=build_test_pipeline(redis=InMemoryRedis(), submit_client=client),
+        offset_tracker=tracker,
+    )
+    original = kafka_consumer_module.IN_FLIGHT_DRAIN_TIMEOUT_SECONDS
+    try:
+        old_epoch = tracker.track(key, 0)
+        consumer._inflight[key] = 1
+        consumer._handle_safely(_message(0).value(), key, 0, old_epoch, threading.Event())
+    finally:
+        kafka_consumer_module.IN_FLIGHT_DRAIN_TIMEOUT_SECONDS = original
+
+    assert holder["new_epoch"] != old_epoch
+    assert tracker.commits_due() == [(key, 0)]  # not 1
+
+
+def test_lost_partitions_are_forgotten_without_a_commit(monkeypatch):
+    pool = _DeferredWorkerPool()
+    consumer = _accepting_consumer(worker_pool=pool)
+    observed = {}
+
+    def lose(fake):
+        commits_before = len(fake.commits)
+        fake.lose(0)
+        observed["commits_during_lost"] = len(fake.commits) - commits_before
+        observed["due_after"] = consumer._tracker.commits_due()
+
+    script = [_message(0), lambda fake: pool.run(0), lose]
+    _run_loop(consumer, script, monkeypatch)
+
+    assert observed["commits_during_lost"] == 0
+    assert observed["due_after"] == []
+
+
+def test_shutdown_waits_for_workers():
+    calls = []
+
+    class RecordingPool(_DeferredWorkerPool):
+        def shutdown(self, *, wait):
+            calls.append(wait)
+
+    consumer = build_test_consumer(worker_pool=RecordingPool())
+    fake = _FakeKafkaConsumer([], on_exhausted=consumer.stop)
+    consumer._create_consumer = lambda: fake
+    original = signal.signal
+    signal.signal = lambda *_: None
+    try:
+        consumer.start()
+    finally:
+        signal.signal = original
+
+    assert calls == [True]
+
+
+def test_commit_callback_is_wired_into_the_kafka_client(monkeypatch):
+    import confluent_kafka
+
+    captured = {}
+
+    class CapturingConsumer:
+        def __init__(self, config):
+            captured.update(config)
+
+    monkeypatch.setattr(confluent_kafka, "Consumer", CapturingConsumer)
+    consumer = build_test_consumer()
+
+    consumer._create_consumer()
+
+    assert captured["on_commit"] == consumer._on_commit
+    assert captured["enable.auto.commit"] is False
+
+
+def test_polling_continues_while_every_worker_is_blocked(monkeypatch):
+    """AC7: a blocked submit never stalls the poll loop (heartbeats, rebalances)."""
+    release = threading.Event()
+    client = ScriptedSubmitClient(ACCEPTED, on_submit=lambda _r: release.wait(5))
+    consumer = build_test_consumer(
+        pipeline=build_test_pipeline(redis=InMemoryRedis(), submit_client=client),
+        worker_pool=BoundedWorkerPool(1),
+    )
+    observed = {}
+
+    def record(fake):
+        observed["polls_while_blocked"] = fake.polls
+        release.set()
+
+    def await_second_submit(_fake):
+        # Stopping cancels work not yet attempted, so let it reach the API.
+        deadline = time.monotonic() + 5
+        while len(client.requests) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    script = [_message(0), *([None] * 25), record, _message(1), await_second_submit]
+    fake = _run_loop(consumer, script, monkeypatch)
+
+    assert observed["polls_while_blocked"] >= 25
+    assert len(client.requests) == 2
+    assert fake.pause_calls  # saturation paused partitions meanwhile

@@ -120,9 +120,10 @@ class SubmitPipeline:
     ) -> Optional[AttemptResult]:
         """Attempt until the message settles; None when handed back to Kafka.
 
-        `cancelled` is the consumer's shutdown signal and `still_owned` reports
-        whether this consumer still holds the message's partition. Either one
-        ending abandons the message unsettled: its offset is never committed,
+        `cancelled` is set on shutdown and on revoke of the message's partition
+        (it also cuts a backoff sleep short); `still_owned` reports whether this
+        consumer still holds the partition. Either one ending abandons the
+        message unsettled: its offset is never committed,
         so Kafka redelivers it (to this process after a restart, or to the new
         owner after a rebalance) and the idempotent sequence runs again there.
         """
@@ -149,10 +150,12 @@ class SubmitPipeline:
     def _abandon_reason(
         cancelled: threading.Event, still_owned: Callable[[], bool]
     ) -> Optional[AbandonReason]:
-        if cancelled.is_set():
-            return AbandonReason.SHUTDOWN
+        # Ownership first: a revoke also sets `cancelled` (to wake the backoff
+        # sleep), and must be counted as a revoke, not a shutdown.
         if not still_owned():
             return AbandonReason.REVOKED
+        if cancelled.is_set():
+            return AbandonReason.SHUTDOWN
         return None
 
     def _backoff_delay(self, attempt: int) -> float:

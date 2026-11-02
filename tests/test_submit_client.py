@@ -135,9 +135,8 @@ VALIDATION_ERRORS = b'{"errors": [{"field": "history_id", "code": "required", "m
 
 
 @pytest.mark.parametrize("code", [400, 404, 409, 422])
-@pytest.mark.parametrize("body", [REFUSAL, VALIDATION_ERRORS])
-def test_typed_definitive_refusals_are_rejections(code, body):
-    result = classify_response(code, body)
+def test_typed_definitive_refusals_are_rejections(code):
+    result = classify_response(code, REFUSAL)
 
     assert result.outcome is SubmitOutcome.REJECTED
     assert result.http_status == code
@@ -149,6 +148,7 @@ def test_typed_definitive_refusals_are_rejections(code, body):
     [
         b'{"detail": "Not Found"}',  # FastAPI default: a misrouted URL
         b'{"detail": "Automation not found"}',
+        VALIDATION_ERRORS,  # generic validation: schema drift hits every message
         b"{}",
         b'{"errors": []}',
         b'{"errors": ["x"]}',
@@ -175,7 +175,7 @@ def test_proxy_environment_is_ignored():
 def test_everything_else_is_a_retryable_api_error(code):
     result = classify_response(code, b"{}")
 
-    assert result.outcome in {SubmitOutcome.API_ERROR, SubmitOutcome.INVALID_RESPONSE}
+    assert result.outcome is SubmitOutcome.API_ERROR
     assert result.acknowledged is False
 
 

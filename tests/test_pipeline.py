@@ -7,6 +7,7 @@ API is scripted. Each test names the table row it pins.
 import json
 import logging
 import threading
+import time
 from uuid import UUID
 
 import pytest
@@ -473,8 +474,10 @@ def test_shutdown_during_backoff_abandons_without_another_attempt():
         "keep_automation_consumer_messages_abandoned_total", reason="shutdown"
     )
 
+    started = time.monotonic()
     result = pipeline.run(message(), cancelled=cancelled)  # must not sleep 60s
 
+    assert time.monotonic() - started < 1.0
     assert result is None
     assert len(client.requests) == 1
     assert (
@@ -497,6 +500,23 @@ def test_losing_the_partition_abandons_the_retry():
 
     assert result is None
     assert len(client.requests) == 1
+
+
+def test_revocation_is_reported_as_revoked_even_when_cancelled():
+    """A revoke sets the cancel event (to wake the backoff) and drops ownership;
+    it must be counted as a revoke, not a shutdown."""
+    cancelled = threading.Event()
+    cancelled.set()
+    before = counter(
+        "keep_automation_consumer_messages_abandoned_total", reason="revoked"
+    )
+    pipeline = build_test_pipeline(redis=InMemoryRedis())
+
+    assert pipeline.run(message(), cancelled=cancelled, still_owned=lambda: False) is None
+    assert (
+        counter("keep_automation_consumer_messages_abandoned_total", reason="revoked")
+        == before + 1
+    )
 
 
 def test_already_cancelled_message_is_not_attempted():

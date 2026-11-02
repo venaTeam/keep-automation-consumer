@@ -106,6 +106,15 @@ AUTOMATION_API_TIMEOUT_SECONDS = min(
     max(1.0, config("AUTOMATION_API_TIMEOUT_SECONDS", default="10.0", cast=float)),
 )
 
+# Bound on waiting for in-flight submits when partitions are revoked: one
+# attempt's worst case (connect + write + read) plus margin. Far below
+# `max.poll.interval.ms`. Shutdown drains the same work, so the pod's
+# `terminationGracePeriodSeconds` must exceed this by a few seconds (~35s+ at
+# the defaults; the k8s default of 30s is too short).
+IN_FLIGHT_DRAIN_TIMEOUT_SECONDS = (
+    AUTOMATION_API_CONNECT_TIMEOUT_SECONDS + 2 * AUTOMATION_API_TIMEOUT_SECONDS + 5.0
+)
+
 # Backoff between attempts of an unacknowledged submit (429 capacity, 5xx,
 # transport error). Capped exponential with jitter; retries continue until the
 # message settles, the consumer stops, or its partition is revoked.

@@ -219,6 +219,14 @@ partitions_paused_uncommitted = Gauge(
     "Partitions paused because their uncommitted offset window is full",
 )
 
+# A revoke waits for in-flight work on the revoked partitions before
+# committing; this counts revokes that gave up at IN_FLIGHT_DRAIN_TIMEOUT_SECONDS
+# (the work is then redelivered to the next owner while it may still run here).
+revoke_drain_timeouts = Counter(
+    "keep_automation_consumer_revoke_drain_timeouts_total",
+    "Partition revokes that stopped waiting for in-flight submits",
+)
+
 # A message polled while its partition was paused or no worker was free is
 # rewound (seek) and fetched again later — never dispatched, never dropped.
 messages_rewound = Counter(
