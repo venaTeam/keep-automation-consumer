@@ -5,12 +5,81 @@ Consumer service for the Keep **Automations** feature. It reads the
 the automation API's idempotent submit endpoint — committing the matched-topic
 offset only after an API-confirmed submit.
 
-> **Status: C8 skeleton + C9 idempotency gate + C10 cooldown gate.** The consume loop runs the
-> idempotency gate per message and logs the decision (duplicates are audited,
-> everything else would submit). Offsets are still **never committed**
-> (`enable.auto.commit=false`) and no submit call exists yet — those land in
-> C11 (submit + gate lifecycle wiring + offset commit + fail-open). C10 is
-> deliberately dark until that orchestration exists.
+> **Status: C8 skeleton + C9 idempotency gate + C10 cooldown gate + C11 submit
+> pipeline.** Every message runs gates → `POST /internal/submit` → gate
+> lifecycle, and its offset commits only once it settles.
+> ⚠️ **Do not point a deployed consumer at the API before D17 lands:** today's
+> stub answers `{"status":"ok"}`, which is not a contract acknowledgement, so
+> every message retries forever (loud, nothing lost, nothing runs).
+
+## Submit pipeline (C11)
+
+Per message (spec §5.2, `src/bl/pipeline.py`):
+
+| Result | Idem key | `run_id`-owned cooldown claim | Offset |
+|---|---|---|---|
+| idem `duplicate` | — | not claimed | **commit** — audit `duplicate` |
+| cooldown `suppressed` | — | the winner's, untouched | **commit** — audit `cooldown` |
+| 200 `accepted` | → `done` | compare-and-extend (armed) | **commit** |
+| 200 `already_submitted` / `suppressed` | → `done` | compare-and-delete | **commit** |
+| 429 `capacity` | `pending` | compare-and-delete | retry + `submit_capacity_backoffs_total` |
+| 5xx / 408 / 401 / 403 / transport / timeout / 200 without a known status | `pending` | compare-and-delete | retry |
+| 400 / 404 / 409 / 422 — definitive refusal | `pending` | compare-and-delete | **commit (skip)** + `submit_rejected_total` + ERROR log |
+| Redis unreachable | gate skipped | gate skipped, **no Redis call** | per response; `gate_flags` say `skipped` |
+
+- **`run_id`** is minted per delivered message (`uuid4`) and reused for every
+  retry of it: it is the cooldown ownership token and the submit's trace id.
+- **Retries happen in the worker**, re-running the whole sequence (exactly what
+  a Kafka redelivery would do), with capped exponential backoff + jitter, until
+  the message settles, the consumer stops, or its partition is revoked. The poll
+  thread never waits on Redis or HTTP (ADR-007). While the API is down every
+  worker ends up retrying, the pool saturates, all partitions pause and polling
+  continues — Kafka is the queue.
+- **`gate_flags`** ride the submit request (contracts §Submit) so the API's
+  audit row records degraded runs: `idempotency` + `reason`, `cooldown` +
+  `cooldown_reason` + `cooldown_missing_fields`.
+- **Offsets** commit per partition at the contiguous settled position
+  (`src/core/offset_tracker.py`): a message still retrying holds back its own
+  partition only. Only the poll thread touches the Kafka client — async commits
+  every `KAFKA_COMMIT_INTERVAL_SECONDS`, synchronous on revoke and at shutdown
+  (after workers drain). A partition whose uncommitted window reaches
+  `MAX_UNCOMMITTED_OFFSETS_PER_PARTITION` pauses alone. A polled message that
+  cannot be dispatched yet is rewound (seek) and stays outstanding, so no commit
+  passes it. Rebalance epochs make a stale worker's late settle a no-op.
+- **Poison** (unparseable message, unexpected exception) is skipped and
+  committed past, counted in `deserialize_errors_total` / `handle_errors_total`
+  — an unsettled poison message would block its partition forever.
+- **Redis recovery** follows the C9 breaker: after an outage the gates resume
+  within one `REDIS_BREAKER_OPEN_SECONDS` window (a burst arriving during the
+  half-open probe still fails open around it).
+
+| Env var | Default | |
+|---|---|---|
+| `AUTOMATION_API_URL` | *(required)* | http(s) base URL; startup fails without it, before joining the group |
+| `INTERNAL_SERVICE_TOKEN` | *(empty)* | Sent as `Authorization: Bearer`; empty sets `submit_config_missing{setting="service_token"}` |
+| `AUTOMATION_API_TIMEOUT_SECONDS` / `AUTOMATION_API_CONNECT_TIMEOUT_SECONDS` | `10` / `2` | Clamped to ≤20 / ≤5 — under the 30s provisional cooldown TTL |
+| `SUBMIT_RETRY_BACKOFF_INITIAL_SECONDS` / `SUBMIT_RETRY_BACKOFF_MAX_SECONDS` | `1` / `30` | Retry backoff |
+| `KAFKA_COMMIT_INTERVAL_SECONDS` | `1.0` | Async commit cadence |
+| `MAX_UNCOMMITTED_OFFSETS_PER_PARTITION` | `1000` | Per-partition pause threshold |
+
+| Metric | |
+|---|---|
+| `..._submits_total{outcome}` | every attempt by classified outcome |
+| `..._submit_capacity_backoffs_total` | 429s — sustained rate means the API's in-flight ceiling is saturated (→ us, spec §9.3) |
+| `..._submit_rejected_total{status}` | **any** increase is an automation that will not run (→ us) |
+| `..._fail_open_submits_total{reason}` | submits sent without the idempotency gate — the loud Redis-down signal (→ us, spec §9.3) |
+| `..._submit_duration_seconds` | acknowledgement latency |
+| `..._messages_abandoned_total{reason}` | unsettled messages handed back on shutdown/revoke (redelivered, not lost) |
+| `..._offset_commits_total` / `..._offset_commit_errors_total` | commits issued / failed (failed ones are re-offered) |
+| `..._partitions_paused_uncommitted_window` | partitions paused behind a stuck message |
+| `..._messages_rewound_total` | polled messages handed back to the fetcher |
+| `..._submit_config_missing{setting}` | startup config gaps |
+
+Suggested alert expressions for I34 (routing is I34's):
+`increase(..._submit_rejected_total[5m]) > 0`;
+`rate(..._fail_open_submits_total{reason="redis_unavailable"}[5m]) > 0`;
+`rate(..._submit_capacity_backoffs_total[10m]) > 0` for 10m;
+`..._partitions_paused_uncommitted_window > 0` for 10m.
 
 ## Idempotency gate (C9)
 
@@ -29,7 +98,7 @@ The gate is an optimisation, never the authority: the API's unique
 short-circuits to `200 already submitted` without calling `/run`. So every
 ambiguous case submits — dropping a message would trade a cheap duplicate for a
 lost automation. `done` is written only on an **API-confirmed** submit
-(`mark_done`, wired in C11); there is no `release()` on failure, because
+(`mark_done`, called by the C11 pipeline); there is no `release()` on failure, because
 `pending` already routes a redelivery to a submit.
 
 Redis being sick must cost ~0, not a timeout per message: socket timeouts bound
@@ -58,9 +127,12 @@ extending to full `cooldown_seconds` — arming retires the token, so an armed
 claim can no longer be extended or deleted by anyone (a misplaced `release()`
 cannot drop a live cooldown). `release()` compares before deleting a still-
 provisional claim. A stale delivery therefore cannot mutate
-a replacement claim. The exact 30-second provisional TTL covers the future
-C11 submit/accept round trip; there is no watchdog. C11 will call `activate`
-only for `200 accepted` and `release` for failures, 429s, and other 200 statuses.
+a replacement claim. The exact 30-second provisional TTL covers the C11
+submit/accept round trip (the submit timeout is clamped under it); there is no
+watchdog. The pipeline calls `activate` only for `200 accepted` and `release`
+for failures, 429s, definitive refusals and other 200 statuses. Its flags are
+namespaced (`cooldown`, `cooldown_reason`, `cooldown_missing_fields`) so they
+merge with the idempotency flags into the submit's `gate_flags`.
 
 | Env var | Default | |
 |---|---|---|
@@ -93,13 +165,17 @@ with a logging stub until D17/D19 expose the endpoint.
 |---|---|
 | `src/consumer_main.py` | Standalone entrypoint: metrics server + health server + blocking consume loop. |
 | `src/main.py` | FastAPI health/metrics app (K8s probes / scrape). |
-| `src/core/kafka_consumer.py` | Consumer (auto-commit off) → subscribe → poll → bounded worker dispatch → gate. |
+| `src/core/kafka_consumer.py` | Consumer (auto-commit off) → poll → bounded worker dispatch → contiguous per-partition commits; rebalance + shutdown handling. |
+| `src/core/offset_tracker.py` | Per-partition commit positions (lowest outstanding offset) with assignment epochs. |
 | `src/core/worker_pool.py` | Nonblocking bounded worker pool; saturation pauses partitions while Kafka polling continues. |
-| `src/config/` | Env config + constants (topic, group, ports, worker-pool size, Redis). |
+| `src/config/` | Env config + constants (topic, group, ports, worker-pool size, Redis, automation API, retry/commit tuning). |
 | `src/core/redis_client.py` | Process-lifetime Redis client (build once — a per-call pool leaks fds). |
 | `src/models/matched_message.py` | Matched-message shape (contracts §"Matched message"). |
 | `src/bl/gates/idempotency.py` | Idempotency gate (C9). |
-| `src/bl/gates/cooldown.py` | Owned cooldown gate (C10); lifecycle wiring lands in C11. |
+| `src/bl/pipeline.py` | C11 orchestration: gates → submit → gate lifecycle, retry loop. |
+| `src/bl/submit_client.py` | `POST /internal/submit` client + response classification. |
+| `src/models/submit.py` | Submit request/response mirror (contracts §Submit). |
+| `src/bl/gates/cooldown.py` | Owned cooldown gate (C10). |
 | `src/bl/gates/cooldown_redis.py` | Atomic Redis activation/release mechanics for owned cooldown claims. |
 | `src/bl/gates/cooldown_key.py` | Cooldown key + entity-hash construction, mirroring `automation-contracts.md` §Redis keys (the doc is authoritative; golden byte/hash fixtures in tests pin the mirror). |
 | `src/bl/suppression_audit.py` | Suppression audit Protocol + logging stub (D17 swaps it). |
@@ -111,6 +187,8 @@ Ports: health **8092**, metrics **8094**.
 ```bash
 docker compose -f docker-compose.infra.yml up -d   # kafka + zookeeper
 export REDIS_URL=redis://localhost:6379            # gates; unset = fail open
+export AUTOMATION_API_URL=http://localhost:8083    # required (keep-automation-api)
+export INTERNAL_SERVICE_TOKEN=...                  # same value as the API's
 poetry install
 poetry run python -m src.consumer_main             # start the consume loop
 # in another shell, produce a test message to the matched-alerts topic
