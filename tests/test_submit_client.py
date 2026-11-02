@@ -130,12 +130,45 @@ def test_capacity_429_is_its_own_outcome():
     assert result.acknowledged is False
 
 
+REFUSAL = b'{"status": "rejected", "reason": "tenant_mismatch"}'
+VALIDATION_ERRORS = b'{"errors": [{"field": "history_id", "code": "required", "message": "x"}]}'
+
+
 @pytest.mark.parametrize("code", [400, 404, 409, 422])
-def test_definitive_refusals_are_rejections(code):
-    result = classify_response(code, b"{}")
+@pytest.mark.parametrize("body", [REFUSAL, VALIDATION_ERRORS])
+def test_typed_definitive_refusals_are_rejections(code, body):
+    result = classify_response(code, body)
 
     assert result.outcome is SubmitOutcome.REJECTED
     assert result.http_status == code
+
+
+@pytest.mark.parametrize("code", [400, 404, 409, 422])
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"detail": "Not Found"}',  # FastAPI default: a misrouted URL
+        b'{"detail": "Automation not found"}',
+        b"{}",
+        b'{"errors": []}',
+        b'{"errors": ["x"]}',
+        b"<html>404</html>",
+        b"",
+    ],
+)
+def test_untyped_refusal_statuses_are_retried_not_skipped(code, body):
+    """A wrong server answers every message like this; skipping on it would
+    commit past the whole topic."""
+    result = classify_response(code, body)
+
+    assert result.outcome is SubmitOutcome.API_ERROR
+    assert result.acknowledged is False
+
+
+def test_proxy_environment_is_ignored():
+    client = _client(lambda request: httpx.Response(200, json={"status": "accepted"}))
+
+    assert client._client.trust_env is False
 
 
 @pytest.mark.parametrize("code", [500, 502, 503, 504, 408, 401, 403, 307, 201, 413])

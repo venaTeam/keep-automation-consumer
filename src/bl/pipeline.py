@@ -12,7 +12,7 @@ One attempt is the whole sequence a Kafka redelivery would run:
 | 200 `already_submitted` / `suppressed` | → `done` | compare-and-delete | yes |
 | 429 `capacity` | stays `pending` | compare-and-delete | no — retry (+ capacity metric) |
 | 5xx / 408 / 401 / 403 / transport / invalid 200 | stays `pending` | compare-and-delete | no — retry |
-| 400 / 404 / 409 / 422 (definitive refusal) | stays `pending` | compare-and-delete | yes — skipped, loud |
+| 400 / 404 / 409 / 422 + typed refusal body | stays `pending` | compare-and-delete | yes — skipped, loud |
 
 Redis unavailable at the idempotency gate ⇒ the cooldown gate is skipped
 without a Redis call, and the submit carries `gate_flags` saying so (spec §6.3:

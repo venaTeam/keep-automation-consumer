@@ -31,9 +31,12 @@ SUBMIT_PATH = "/internal/submit"
 
 # The API refused this message for good (spec §8.4, contracts §Submit): bad
 # request, unknown automation, tenant mismatch, validation. Retrying cannot
-# succeed, so the pipeline skips it. Everything else is retryable — including
-# 401/403, because a token misconfiguration recovers once it is fixed.
+# succeed, so the pipeline skips it — but only when the body proves it is the
+# submit endpoint refusing (see `_is_refusal_body`). Everything else is
+# retryable, including 401/403 (a token misconfiguration recovers once fixed)
+# and 413 (an ingress body limit recovers once raised).
 DEFINITIVE_REFUSAL_STATUSES = frozenset({400, 404, 409, 422})
+REFUSAL_STATUS = "rejected"
 CAPACITY_STATUS = 429
 
 _ACKNOWLEDGED = {
@@ -55,8 +58,8 @@ class HttpSubmitClient:
     `httpx.Client` is thread-safe and pools connections; building one per
     message would pay a TCP (and TLS) handshake per submit at ~200/s. The pool is
     sized to the worker pool so a worker never waits on a connection slot.
-    Redirects are not followed: a redirect from an internal endpoint is a
-    routing mistake, and following it could carry the token elsewhere.
+    Redirects are not followed and proxy env vars are ignored: either would be
+    a routing mistake that could carry the token elsewhere.
     """
 
     def __init__(
@@ -81,6 +84,9 @@ class HttpSubmitClient:
                 max_keepalive_connections=max_connections,
             ),
             follow_redirects=False,
+            # The target is always the internal API: never route the token and
+            # payloads through a proxy picked up from HTTP(S)_PROXY.
+            trust_env=False,
             transport=transport,
         )
 
@@ -121,12 +127,38 @@ def classify_response(status_code: int, body: bytes) -> SubmitResult:
         return SubmitResult(
             SubmitOutcome.CAPACITY, http_status=status_code, error="capacity"
         )
-    if status_code in DEFINITIVE_REFUSAL_STATUSES:
+    if status_code in DEFINITIVE_REFUSAL_STATUSES and _is_refusal_body(body):
         return SubmitResult(
             SubmitOutcome.REJECTED, http_status=status_code, error=f"http_{status_code}"
         )
     return SubmitResult(
         SubmitOutcome.API_ERROR, http_status=status_code, error=f"http_{status_code}"
+    )
+
+
+def _is_refusal_body(body: bytes) -> bool:
+    """Whether a 4xx body is the submit endpoint's own typed refusal.
+
+    A skip commits past the message for good, so the status code alone is not
+    enough: a misrouted `AUTOMATION_API_URL` (the gateway, a wrong path prefix,
+    an image without the route) answers *every* message with a framework
+    default like `404 {"detail": "Not Found"}`, and treating that as a refusal
+    would drain the topic. Only the contract's refusal shapes count —
+    `{"status": "rejected", ...}` or the validation `{"errors": [{code...}]}`.
+    """
+    try:
+        data = json.loads(body)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if data.get("status") == REFUSAL_STATUS:
+        return True
+    errors = data.get("errors")
+    return (
+        isinstance(errors, list)
+        and bool(errors)
+        and all(isinstance(error, dict) and "code" in error for error in errors)
     )
 
 

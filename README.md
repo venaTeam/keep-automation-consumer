@@ -24,7 +24,8 @@ Per message (spec §5.2, `src/bl/pipeline.py`):
 | 200 `already_submitted` / `suppressed` | → `done` | compare-and-delete | **commit** |
 | 429 `capacity` | `pending` | compare-and-delete | retry + `submit_capacity_backoffs_total` |
 | 5xx / 408 / 401 / 403 / transport / timeout / 200 without a known status | `pending` | compare-and-delete | retry |
-| 400 / 404 / 409 / 422 — definitive refusal | `pending` | compare-and-delete | **commit (skip)** + `submit_rejected_total` + ERROR log |
+| 400 / 404 / 409 / 422 **with the API's typed refusal body** | `pending` | compare-and-delete | **commit (skip)** + `submit_rejected_total` + ERROR log |
+| the same statuses without it (a misrouted URL's default 404), 413, any other 4xx | `pending` | compare-and-delete | retry — fixing the routing/limit recovers; a skip never would |
 | Redis unreachable | gate skipped | gate skipped, **no Redis call** | per response; `gate_flags` say `skipped` |
 
 - **`run_id`** is minted per delivered message (`uuid4`) and reused for every
