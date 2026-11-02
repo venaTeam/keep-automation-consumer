@@ -19,9 +19,9 @@ Per message (spec §5.2, `src/bl/pipeline.py`):
 | Result | Idem key | `run_id`-owned cooldown claim | Offset |
 |---|---|---|---|
 | idem `duplicate` | — | not claimed | **commit** — audit `duplicate` |
-| cooldown `suppressed` | — | the winner's, untouched | **commit** — audit `cooldown` |
-| 200 `accepted`, or `already_submitted` carrying this message's own `run_id` (its earlier accept's response was lost) | → `done` | compare-and-extend (armed) | **commit** |
-| any other 200 `already_submitted` / `suppressed` | → `done` | compare-and-delete | **commit** |
+| cooldown `suppressed` | — | the other event's, untouched | **commit** — audit `cooldown` |
+| 200 `accepted`, or `already_submitted` carrying the event's `run_id` **with evidence it is recent** — this attempt re-entered the claim, or an earlier attempt of this delivery reached the API | → `done` | compare-and-extend (armed) | **commit** |
+| `suppressed`, or a stale `already_submitted` (offset replay, a copy past the idempotency TTL) | → `done` | compare-and-delete — never restarts the entity's window | **commit** |
 | 429 `capacity` | `pending` | compare-and-delete | retry + `submit_capacity_backoffs_total` |
 | 5xx / 408 / 401 / 403 / transport / timeout / 200 without a known status | `pending` | compare-and-delete | retry |
 | 400 / 404 / 409 / 422 **with the API's refusal body** `{"status":"rejected"}` | `pending` | compare-and-delete | **commit (skip)** + `submit_rejected_total` + ERROR log |
@@ -30,11 +30,15 @@ Per message (spec §5.2, `src/bl/pipeline.py`):
 | unexpected exception inside an attempt | `pending` | compare-and-delete | retry + `pipeline_errors_total` — never committed past |
 | Redis unreachable | gate skipped | gate skipped, **no Redis call** | per response; `gate_flags` say `skipped` |
 
-- **`run_id`** is minted per delivered message (`uuid4`) and reused for every
-  retry of it: it is the cooldown ownership token and the submit's trace id.
-  Because it is reused, a retry that finds the cooldown key holding its own
-  `run_id` (an earlier attempt's release, or its claim reply, was lost to a
-  Redis blip) **re-enters** that claim instead of suppressing itself.
+- **`run_id`** is derived per event — `uuid5(RUN_ID_NAMESPACE,
+  "{automation_id}:{history_id}")` (contracts §Submit, `src/models/submit.py`,
+  golden values in `tests/test_run_id.py`) — so every retry **and every
+  redelivery** of one event carries the same one. It is the cooldown ownership
+  token and the submit's trace id. A delivery that finds the cooldown key
+  holding its own `run_id` **re-enters** that claim instead of suppressing
+  itself: a retry whose release (or claim reply) was lost to a Redis blip, a
+  redelivery after a crash (SIGKILL/OOM) left the claim behind, or a sibling is
+  still mid-submit after a revoke drain gave up. `run_id` is not a secret.
 - **Retries happen in the worker**, re-running the whole sequence (exactly what
   a Kafka redelivery would do), with capped exponential backoff + jitter, until
   the message settles, the consumer stops, or its partition is revoked. The poll
@@ -81,14 +85,12 @@ bounded by `IN_FLIGHT_DRAIN_TIMEOUT_SECONDS` = connect + 2 × read timeout + 5s
 drains the same work, so set the pod's **`terminationGracePeriodSeconds` ≥ 35**
 (the Kubernetes default of 30 is too short at the defaults).
 
-**Crash redelivery depends on `session.timeout.ms` > 30s.** A hard crash (OOM,
-SIGKILL) skips the drain and can leave a 30s provisional cooldown claim owned by
-a dead `run_id`. Its partitions only move after the dead member's session
-expires (librdkafka default 45s; measured ~60s to re-assignment), so the claim
-is gone before the event is redelivered. Lowering `session.timeout.ms` under
-~30s, or enabling static membership (`group.instance.id`), would let the
-redelivered event lose the claim to its own dead sibling and be suppressed —
-keep both as they are (spec gap recorded in VAULT, C11 follow-ups).
+**Crash redelivery needs no group-timing invariant.** A hard crash (OOM,
+SIGKILL) skips the drain and can leave a 30s provisional cooldown claim behind.
+Its redelivery derives the same `run_id`, re-enters that claim and submits, so
+lowering `session.timeout.ms` or enabling static membership
+(`group.instance.id`) is safe (ADR-020). Other events for the entity are still
+suppressed until the orphaned claim's 30s TTL expires (spec §5.2, accepted).
 
 | Metric | |
 |---|---|
@@ -150,20 +152,24 @@ The entity hash is deterministic: sort the declared fields, encode compact
 Unicode JSON `[field,value]` pairs, then SHA-256. Missing declared fields run
 without a key and carry a warning; an empty field list creates a
 whole-automation key. Losing NX suppresses without refreshing the winner's TTL —
-unless the key holds this message's own `run_id`: a Lua reclaim re-enters it and
+unless the key holds this event's own `run_id`: a Lua reclaim re-enters it and
 refreshes the 30s TTL (a vanished key is simply claimed). A failed reclaim fails
-open, since the claim might be our own.
+open, since the claim might be our own. Re-entry is counted in
+`cooldown_claims_reentered_total`; on the wire it is just `cooldown=claimed`.
 
 The claim value is an ownership token. `activate()` uses Lua to compare the
 stored value with `run_id` and, on match, atomically rotate it to `done` while
 extending to full `cooldown_seconds` — arming retires the token, so an armed
 claim can no longer be extended or deleted by anyone (a misplaced `release()`
 cannot drop a live cooldown). `release()` compares before deleting a still-
-provisional claim. A stale delivery therefore cannot mutate
-a replacement claim. The exact 30-second provisional TTL covers the C11
+provisional claim. A delivery of another event therefore cannot mutate a
+replacement claim; deliveries of the *same* event share the token, so one
+sibling's release can remove the claim the other is about to arm (that run goes
+without its cooldown — logged, never a lost run). The exact 30-second provisional TTL covers the C11
 submit/accept round trip (the submit timeout is clamped under it); there is no
-watchdog. The pipeline calls `activate` only for `200 accepted` and `release`
-for failures, 429s, definitive refusals and other 200 statuses. Its flags are
+watchdog. The pipeline calls `activate` for `200 accepted` and for an
+`already_submitted` with evidence it is recent, and `release` for failures,
+429s, definitive refusals, `suppressed` and stale `already_submitted`. Its flags are
 namespaced (`cooldown`, `cooldown_reason`, `cooldown_missing_fields`) so they
 merge with the idempotency flags into the submit's `gate_flags`.
 
@@ -183,6 +189,7 @@ means "not scraped":
 |---|---|
 | `..._idempotency_decisions_total{outcome}` | `claimed` / `duplicate` / `ambiguous` / `fail_open`. **Ungated volume is this metric's `fail_open`, not `redis_errors`** — once the breaker is open no Redis call is attempted, so the error counter stops scaling with traffic |
 | `..._cooldown_decisions_total{outcome}` | `disabled` / `claimed` / `suppressed` / `missing_field` / `fail_open` |
+| `..._cooldown_claims_reentered_total` | `claimed` decisions that re-entered the event's own claim — each is an event that would have suppressed itself (lost release, crash redelivery, in-flight sibling) |
 | `..._redis_errors_total{operation}` | the Redis-down signal (`claim` / `get` / `mark_done` plus cooldown claim/TTL/activate/release) |
 | `..._gates_config_missing{setting}` | set at startup. `redis_url` = no URL configured; `redis_client` = URL set but the client could not be built (for example, a typo'd scheme) |
 | `..._handle_errors_total` | messages whose processing raised and were skipped by the poll-loop guard |
