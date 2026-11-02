@@ -73,6 +73,15 @@ bounded by `IN_FLIGHT_DRAIN_TIMEOUT_SECONDS` = connect + 2 × read timeout + 5s
 drains the same work, so set the pod's **`terminationGracePeriodSeconds` ≥ 35**
 (the Kubernetes default of 30 is too short at the defaults).
 
+**Crash redelivery depends on `session.timeout.ms` > 30s.** A hard crash (OOM,
+SIGKILL) skips the drain and can leave a 30s provisional cooldown claim owned by
+a dead `run_id`. Its partitions only move after the dead member's session
+expires (librdkafka default 45s; measured ~60s to re-assignment), so the claim
+is gone before the event is redelivered. Lowering `session.timeout.ms` under
+~30s, or enabling static membership (`group.instance.id`), would let the
+redelivered event lose the claim to its own dead sibling and be suppressed —
+keep both as they are (spec gap recorded in VAULT, C11 follow-ups).
+
 | Metric | |
 |---|---|
 | `..._submits_total{outcome}` | every attempt by classified outcome |
