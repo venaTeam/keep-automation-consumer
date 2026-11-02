@@ -220,8 +220,8 @@ def test_missing_declared_field_proceeds_warns_and_never_touches_redis():
     assert decision.missing_fields == ("node_name",)
     assert decision.gate_flags == {
         "cooldown": "skipped",
-        "reason": "missing_field",
-        "missing_fields": "node_name",
+        "cooldown_reason": "missing_field",
+        "cooldown_missing_fields": "node_name",
     }
     assert redis.calls == []
 
@@ -253,7 +253,7 @@ def test_invalid_config_fails_open_without_redis(cooldown):
 
     assert decision.outcome is CooldownOutcome.FAIL_OPEN
     assert decision.should_submit is True
-    assert decision.gate_flags["reason"] == "invalid_config"
+    assert decision.gate_flags["cooldown_reason"] == "invalid_config"
     assert redis.calls == []
 
 
@@ -264,7 +264,7 @@ def test_redis_claim_error_fails_open():
 
     assert decision.outcome is CooldownOutcome.FAIL_OPEN
     assert decision.should_submit is True
-    assert decision.gate_flags["reason"] == "redis_unavailable"
+    assert decision.gate_flags["cooldown_reason"] == "redis_unavailable"
 
 
 @pytest.mark.parametrize("run_id", ["", "not-a-uuid", None, 42])
@@ -274,7 +274,7 @@ def test_invalid_owner_token_fails_open_without_redis(run_id):
     decision = gate(redis).claim(message(), run_id=run_id)
 
     assert decision.outcome is CooldownOutcome.FAIL_OPEN
-    assert decision.gate_flags["reason"] == "invalid_config"
+    assert decision.gate_flags["cooldown_reason"] == "invalid_config"
     assert redis.calls == []
 
 
@@ -290,7 +290,7 @@ def test_missing_or_raising_client_factory_fails_open(client_factory):
 
     assert decision.outcome is CooldownOutcome.FAIL_OPEN
     assert decision.should_submit is True
-    assert decision.gate_flags["reason"] == "redis_unavailable"
+    assert decision.gate_flags["cooldown_reason"] == "redis_unavailable"
 
 
 def test_ttl_metadata_error_still_suppresses():

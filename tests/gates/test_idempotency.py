@@ -32,7 +32,7 @@ from src.config.consts import (
 )
 from src.core.metrics import GateConfigSetting, RedisOperation
 from src.models.matched_message import MatchedAlertMessage
-from tests.helpers import build_test_consumer
+from tests.helpers import RecordingAuditor, ScriptedSubmitClient, build_test_consumer
 
 AUTOMATION_ID = "3f2b8c1e-4d6a-4b2f-9e77-0a1b2c3d4e5f"
 HISTORY_ID = "evt-789"
@@ -81,36 +81,6 @@ class FakeRedis:
         if "get" in self.fail_on:
             raise ConnectionError("redis down")
         return self.values.get(key)
-
-
-class RecordingAuditor:
-    """Explicit signature on purpose: a `**row` fake would accept a renamed
-    parameter that the real `LoggingSuppressionAuditor` rejects, hiding a
-    TypeError that only fires on the first production duplicate."""
-
-    def __init__(self):
-        self.rows = []
-
-    def record_suppression(
-        self,
-        *,
-        tenant_id,
-        automation_id,
-        history_id,
-        fingerprint,
-        reason,
-        gate_flags=None,
-    ):
-        self.rows.append(
-            {
-                "tenant_id": tenant_id,
-                "automation_id": automation_id,
-                "history_id": history_id,
-                "fingerprint": fingerprint,
-                "reason": reason,
-                "gate_flags": gate_flags,
-            }
-        )
 
 
 def message(**overrides) -> MatchedAlertMessage:
@@ -359,29 +329,31 @@ def test_every_decision_is_counted_by_outcome():
 
 
 def test_each_duplicate_redelivery_is_suppressed_and_audited():
-    """The C9 half of the story's integration check.
+    """The C9 half of the story's integration check, through the consumer.
 
-    Delivery 1 claims and (once C11 lands) submits; `mark_done` stands in for
-    the API-confirmed submit. Both later redeliveries are suppressed and audited.
+    Delivery 1 claims and submits; the API acknowledgement marks the key
+    `done`. Both later redeliveries are suppressed and audited, never submitted.
     """
     redis = FakeRedis()
     gate = gate_with(redis)
     auditor = RecordingAuditor()
+    client = ScriptedSubmitClient()
     consumer = build_test_consumer(
         idempotency_gate=gate,
         suppression_auditor=auditor,
+        submit_client=client,
     )
     raw = json.dumps(MESSAGE).encode("utf-8")
 
     consumer._handle(raw)
     assert auditor.rows == []  # first delivery proceeds
-
-    gate.mark_done(message())  # stands in for the confirmed submit (C11)
+    assert redis.values[idempotency_key(HISTORY_ID, AUTOMATION_ID)] == "done"
 
     consumer._handle(raw)
     consumer._handle(raw)
 
-    assert len(auditor.rows) == 2  # every redelivery is audited, none submitted
+    assert len(client.requests) == 1  # exactly one submit
+    assert len(auditor.rows) == 2  # every redelivery is audited
     assert {row["reason"] for row in auditor.rows} == {REASON_DUPLICATE}
     assert auditor.rows[0]["tenant_id"] == "keep"
     assert auditor.rows[0]["history_id"] == HISTORY_ID
@@ -432,10 +404,10 @@ def test_a_failing_auditor_does_not_escape_handle(caplog):
         idempotency_gate=gate_with(redis), suppression_auditor=AngryAuditor()
     )
 
-    with caplog.at_level(logging.ERROR, logger="src.core.kafka_consumer"):
+    with caplog.at_level(logging.ERROR, logger="src.bl.pipeline"):
         consumer._handle(json.dumps(MESSAGE).encode("utf-8"))  # must not raise
 
-    assert "could not audit a suppressed duplicate" in caplog.records[-1].getMessage()
+    assert "could not audit a duplicate suppression" in caplog.records[-1].getMessage()
 
 
 # -- circuit breaker ----------------------------------------------------------
@@ -680,13 +652,17 @@ def test_error_and_decision_counters_exist_before_the_first_event():
 def test_a_pending_sibling_does_not_suppress_the_redelivery():
     """A crash between claim and submit must not lose the automation."""
     redis = FakeRedis()
+    redis.values[idempotency_key(HISTORY_ID, AUTOMATION_ID)] = "pending"
     auditor = RecordingAuditor()
+    client = ScriptedSubmitClient()
     consumer = build_test_consumer(
-        idempotency_gate=gate_with(redis), suppression_auditor=auditor
+        idempotency_gate=gate_with(redis),
+        suppression_auditor=auditor,
+        submit_client=client,
     )
-    raw = json.dumps(MESSAGE).encode("utf-8")
 
-    consumer._handle(raw)
-    consumer._handle(raw)
+    consumer._handle(json.dumps(MESSAGE).encode("utf-8"))
 
     assert auditor.rows == []
+    assert len(client.requests) == 1
+    assert client.requests[0].gate_flags["idempotency"] == "ambiguous"

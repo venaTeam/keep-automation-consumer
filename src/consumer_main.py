@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
-"""Standalone matched-alerts consumer entrypoint (C8 skeleton).
+"""Standalone matched-alerts consumer entrypoint.
 
-Starts a Prometheus metrics server + a stdlib health server, then runs the
-blocking Kafka consume loop. Mirrors keep-event-handler's consumer_main.py.
+Starts a Prometheus metrics server + a stdlib health server, composes the C11
+submit pipeline (gates → submit client), then runs the blocking Kafka consume
+loop. Mirrors keep-event-handler's consumer_main.py.
 """
 import logging
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
+from urllib.parse import urlsplit
 
 from prometheus_client import start_http_server
 from redis import Redis
 
 from src import logging_conf
+from src.bl.gates.cooldown import CooldownGate
 from src.bl.gates.idempotency import IdempotencyGate
+from src.bl.pipeline import SubmitPipeline
+from src.bl.submit_client import HttpSubmitClient
 from src.bl.suppression_audit import LoggingSuppressionAuditor
 from src.config.consts import (
+    AUTOMATION_API_CONNECT_TIMEOUT_SECONDS,
+    AUTOMATION_API_TIMEOUT_SECONDS,
+    AUTOMATION_API_URL,
     HEALTH_CHECK_PORT,
+    INTERNAL_SERVICE_TOKEN,
     PROMETHEUS_METRICS_PORT,
     WORKER_POOL_SIZE,
 )
@@ -25,6 +34,7 @@ from src.core.kafka_consumer import MatchedAlertConsumer
 from src.core.metrics import (
     GateConfigSetting,
     gate_config_missing_gauges,
+    service_token_missing,
 )
 from src.core.redis_client import (
     get_redis_client,
@@ -72,8 +82,8 @@ def configure_redis() -> Optional[Redis]:
         redis_url_gauge.set(1)
         redis_client_gauge.set(1)
         logger.warning(
-            "automations: REDIS_URL is not set — the idempotency gate is "
-            "disabled and every message will be submitted ungated (fail-open). "
+            "automations: REDIS_URL is not set — the idempotency and cooldown "
+            "gates are disabled and every message is submitted ungated (fail-open). "
             "Duplicate protection falls entirely to the API's unique "
             "(history_id, automation_id) constraint."
         )
@@ -85,7 +95,7 @@ def configure_redis() -> Optional[Redis]:
         redis_client_gauge.set(1)
         logger.warning(
             "automations: REDIS_URL is set but the Redis client could not be "
-            "built — the idempotency gate is disabled for the life of this "
+            "built — the idempotency and cooldown gates are disabled for the life of this "
             "process (fail-open). Fix the configuration and restart."
         )
         return None
@@ -94,27 +104,63 @@ def configure_redis() -> Optional[Redis]:
     return client
 
 
+def build_submit_client() -> HttpSubmitClient:
+    """The API client, or a startup failure: without it nothing can submit.
+
+    Fails before Kafka is touched, so a misconfigured pod crash-loops visibly
+    instead of joining the group and retrying every message forever.
+    """
+    parts = urlsplit(AUTOMATION_API_URL)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise RuntimeError(
+            "AUTOMATION_API_URL must be an http(s) URL of the automation API "
+            "(contracts §Environment & endpoints)"
+        )
+
+    if INTERNAL_SERVICE_TOKEN:
+        service_token_missing.set(0)
+    else:
+        service_token_missing.set(1)
+        logger.warning(
+            "automations: INTERNAL_SERVICE_TOKEN is not set — submits carry no "
+            "service token. Once the API verifies it, every submit is a retried "
+            "401 and nothing commits."
+        )
+
+    return HttpSubmitClient(
+        base_url=AUTOMATION_API_URL,
+        service_token=INTERNAL_SERVICE_TOKEN,
+        timeout_seconds=AUTOMATION_API_TIMEOUT_SECONDS,
+        connect_timeout_seconds=AUTOMATION_API_CONNECT_TIMEOUT_SECONDS,
+        max_connections=WORKER_POOL_SIZE,
+    )
+
+
 def main() -> None:
     logger.info("Starting Keep Automation Consumer (matched-alerts)")
+    submit_client: Optional[HttpSubmitClient] = None
     try:
         start_metrics_server(PROMETHEUS_METRICS_PORT)
         create_health_server(HEALTH_CHECK_PORT)
+        submit_client = build_submit_client()
         redis_client = configure_redis()
         worker_pool = BoundedWorkerPool(WORKER_POOL_SIZE)
-        consumer = MatchedAlertConsumer(
-            idempotency_gate=IdempotencyGate(
-                client_factory=lambda: redis_client,
-            ),
+        pipeline = SubmitPipeline(
+            idempotency_gate=IdempotencyGate(client_factory=lambda: redis_client),
+            cooldown_gate=CooldownGate(client_factory=lambda: redis_client),
+            submit_client=submit_client,
             suppression_auditor=LoggingSuppressionAuditor(),
-            worker_pool=worker_pool,
         )
-        consumer.start()  # blocks until shutdown
+        consumer = MatchedAlertConsumer(pipeline=pipeline, worker_pool=worker_pool)
+        consumer.start()  # blocks until shutdown; workers are drained on return
     except KeyboardInterrupt:
         logger.info("Interrupted, shutting down")
     except Exception as exc:
         logger.exception("Fatal error: %s", exc)
         sys.exit(1)
     finally:
+        if submit_client is not None:
+            submit_client.close()
         reset_redis_client()
     logger.info("Consumer shutdown complete")
 

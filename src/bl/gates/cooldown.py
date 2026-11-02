@@ -1,4 +1,9 @@
-"""Best-effort owned cooldown decisions; C11 wires them into submit flow."""
+"""Best-effort owned cooldown decisions, wired into the submit flow by C11.
+
+`gate_flags` keys are namespaced (`cooldown`, `cooldown_reason`,
+`cooldown_missing_fields`) so they merge with the idempotency gate's flags into
+the submit request's flat `gate_flags` without colliding (contracts §Submit).
+"""
 
 import logging
 import threading
@@ -164,6 +169,20 @@ class CooldownGate:
             next_eligible_at=next_eligible,
         )
 
+    def skip_unavailable(self, message: MatchedAlertMessage) -> CooldownDecision:
+        """Fail open without a Redis call.
+
+        For when the idempotency gate has just found Redis unavailable (error or
+        open breaker): the cooldown gate has no breaker of its own, so claiming
+        anyway would charge a second socket timeout to every message of an
+        outage. The decision is recorded exactly like a Redis-failed claim.
+        """
+        if message.cooldown is None:
+            return self._decide(CooldownOutcome.DISABLED)
+        return self._decide(
+            CooldownOutcome.FAIL_OPEN, reason=REASON_REDIS_UNAVAILABLE
+        )
+
     def activate(self, decision: CooldownDecision) -> bool:
         """Arm the full cooldown only if this decision still owns the key.
 
@@ -284,9 +303,9 @@ class CooldownGate:
         cooldown_decision_counters[outcome].inc()
         flags = {"cooldown": "skipped" if reason else outcome.value}
         if reason:
-            flags["reason"] = reason
+            flags["cooldown_reason"] = reason
         if missing_fields:
-            flags["missing_fields"] = ",".join(missing_fields)
+            flags["cooldown_missing_fields"] = ",".join(missing_fields)
         return CooldownDecision(
             outcome=outcome,
             key=key,
