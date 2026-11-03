@@ -20,15 +20,22 @@ end
 return 0
 """.strip()
 
-# Runs only after a plain `SET NX` lost. Our own token still there means an
-# earlier attempt of this same delivery claimed it and its release (or the
-# claim's reply) never landed: re-enter and refresh. A key that vanished in
-# between is simply claimed. Anything else is another claimant's.
+# `reclaim` results. RECLAIM_REENTERED is evidence the run is recent: a
+# delivery of this event held the claim within the provisional TTL.
+RECLAIM_LOST = 0
+RECLAIM_CLAIMED = 1
+RECLAIM_REENTERED = 2
+
+# Runs only after a plain `SET NX` lost. The run_id is derived per event, so
+# our own token still there means a delivery of this same event claimed it — an
+# earlier attempt whose release (or claim reply) never landed, a delivery killed
+# mid-submit, or a sibling still in flight: re-enter and refresh. A key that
+# vanished in between is simply claimed. Anything else is another event's.
 _RECLAIM_SCRIPT = """
 local current = redis.call('GET', KEYS[1])
 if current == ARGV[1] then
   redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-  return 1
+  return 2
 end
 if not current then
   if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', tonumber(ARGV[2])) then
@@ -81,10 +88,13 @@ class CooldownRedisLifecycle:
         key: str,
         owner_token: str,
         ttl_seconds: int,
-    ) -> bool:
-        """Re-enter a claim this token already holds (or claim a vanished key)."""
+    ) -> int:
+        """Re-enter a claim this token already holds (or claim a vanished key).
+
+        Returns RECLAIM_REENTERED, RECLAIM_CLAIMED or RECLAIM_LOST.
+        """
         _, _, reclaim = self._scripts(client)
-        return bool(reclaim(keys=[key], args=[owner_token, ttl_seconds], client=client))
+        return int(reclaim(keys=[key], args=[owner_token, ttl_seconds], client=client))
 
     def activate(
         self,

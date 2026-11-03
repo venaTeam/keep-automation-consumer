@@ -63,6 +63,14 @@ cooldown_decisions = Counter(
     ["outcome"],
 )
 
+# `claimed` decisions that re-entered a claim the event's own run_id held — a
+# retry after a lost release, a redelivery after a crash, or a sibling still in
+# flight. Each one is an event that would have suppressed itself without re-entry.
+cooldown_claims_reentered = Counter(
+    "keep_automation_consumer_cooldown_claims_reentered_total",
+    "Cooldown claims re-entered by a delivery of the same event",
+)
+
 # The Redis-down signal. Spec §6.3 requires fail-open to page loudly — this is
 # the counter that alert reads (`fail_open_submits` below is the submit-side view).
 redis_errors = Counter(

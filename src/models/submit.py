@@ -8,6 +8,23 @@ shared contracts package, only this repo's mirror of the slice it uses.
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
+from uuid import UUID, uuid5
+
+# contracts §Submit: `run_id = uuid5(RUN_ID_NAMESPACE, f"{automation_id}:{history_id}")`.
+# Pinned forever — changing it would give in-flight events a second run_id that
+# cannot re-enter the cooldown claim their first delivery left behind.
+RUN_ID_NAMESPACE = UUID("4c6f4bd9-3da3-4046-9b16-75097fd337aa")
+
+
+def derive_run_id(automation_id: str, history_id: str) -> str:
+    """The event's run_id: identical for every delivery and retry of one event.
+
+    That is what lets a redelivery re-enter the provisional cooldown claim its
+    own dead delivery left, instead of being suppressed by it. Values are used
+    verbatim, like the idempotency key; `automation_id` is a UUID, so the first
+    `:` is the separator even when `history_id` contains one. Not a secret.
+    """
+    return str(uuid5(RUN_ID_NAMESPACE, f"{automation_id}:{history_id}"))
 
 
 class SubmitStatus(str, Enum):

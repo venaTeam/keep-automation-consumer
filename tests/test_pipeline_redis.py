@@ -10,6 +10,7 @@ import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
@@ -24,6 +25,7 @@ from src.bl.submit_client import HttpSubmitClient
 from src.bl.suppression_audit import REASON_COOLDOWN, REASON_DUPLICATE
 from src.config.consts import IDEMPOTENCY_TTL_SECONDS
 from src.models.matched_message import MatchedAlertMessage
+from src.models.submit import derive_run_id
 from tests.helpers import RecordingAuditor
 
 TEST_REDIS_URL = os.getenv("TEST_REDIS_URL")
@@ -163,6 +165,51 @@ def test_capacity_releases_the_provisional_claim(redis_client):
     assert client.get(idempotency_key(msg.history_id, automation_id)) == "pending"
 
 
+class ProcessKilled(BaseException):
+    """Stands in for SIGKILL/OOM: nothing after it runs in the dying consumer."""
+
+
+@pytest.mark.parametrize("reached_api", [False, True])
+def test_redelivery_after_a_crash_mid_submit_runs_and_arms(redis_client, reached_api):
+    """VAULT C11 follow-up 1, end to end: a consumer killed mid-submit leaves
+    idem `pending` and a provisional claim under the event's run_id. The
+    redelivery — well inside the 30s, as with a short `session.timeout.ms` —
+    must re-enter that claim, not be suppressed by it."""
+    client, automation_id = redis_client
+    api = FakeSubmitApi()
+    msg = message(automation_id)
+    left = {}
+
+    def killed_mid_submit(request):
+        # What Redis holds at the moment of the kill. The dying process's
+        # unwind `release` below never runs under a real SIGKILL, so it is
+        # undone afterwards.
+        for key in [*cooldown_keys(client, automation_id),
+                    idempotency_key(msg.history_id, automation_id)]:
+            left[key] = (client.get(key), client.pttl(key))
+        if reached_api:
+            api.handler(request)  # the API accepted it; the reply never came back
+        raise ProcessKilled
+
+    dying = pipeline_for(client, SimpleNamespace(handler=killed_mid_submit))
+    with pytest.raises(ProcessKilled):
+        dying.run(msg, cancelled=threading.Event())
+    for key, (value, pttl) in left.items():
+        client.set(key, value, px=pttl)
+    (claim_key,) = cooldown_keys(client, automation_id)
+    assert client.get(claim_key) == derive_run_id(automation_id, msg.history_id)
+
+    auditor = RecordingAuditor()
+    result = pipeline_for(client, api, auditor).run(msg, cancelled=threading.Event())
+
+    assert result.outcome == ("already_submitted" if reached_api else "accepted")
+    assert auditor.rows == []
+    assert len(api.rows) == 1
+    assert client.get(claim_key) == COOLDOWN_ARMED_VALUE
+    assert 290 <= client.ttl(claim_key) <= 300
+    assert client.get(idempotency_key(msg.history_id, automation_id)) == "done"
+
+
 def test_concurrent_redeliveries_converge_to_exactly_one_accepted_run(redis_client):
     """The story's chaos property at the pipeline level: however many copies of
     one event race through the gates, the API accepts it exactly once."""
@@ -178,12 +225,17 @@ def test_concurrent_redeliveries_converge_to_exactly_one_accepted_run(redis_clie
 
     outcomes = [r.outcome for r in results]
     assert outcomes.count("accepted") == 1
-    # The consumer's own state: the event is marked done and exactly one
-    # cooldown claim is armed for the full window.
+    # The consumer's own state: the event is marked done, and its cooldown is
+    # either armed for the full window or — when a sibling that saw a stale-
+    # looking already_submitted released the shared provisional claim before
+    # the winner armed it (contracts §Redis keys, accepted trade-off) — absent.
+    # Never a provisional claim left suppressing the entity.
     assert client.get(idempotency_key(msg.history_id, automation_id)) == "done"
-    (key,) = cooldown_keys(client, automation_id)
-    assert client.get(key) == COOLDOWN_ARMED_VALUE
-    assert 290 <= client.ttl(key) <= 300
+    keys = cooldown_keys(client, automation_id)
+    assert len(keys) <= 1
+    for key in keys:
+        assert client.get(key) == COOLDOWN_ARMED_VALUE
+        assert 290 <= client.ttl(key) <= 300
     assert set(outcomes) <= {
         "accepted",
         "already_submitted",

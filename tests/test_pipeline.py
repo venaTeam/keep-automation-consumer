@@ -8,7 +8,6 @@ import json
 import logging
 import threading
 import time
-from uuid import UUID
 
 import pytest
 from prometheus_client import REGISTRY
@@ -24,7 +23,7 @@ from src.bl.gates.idempotency import IdempotencyGate, idempotency_key
 from src.bl.suppression_audit import REASON_COOLDOWN, REASON_DUPLICATE
 from src.config.consts import IDEMPOTENCY_TTL_SECONDS
 from src.models.matched_message import MalformedMessage, MatchedAlertMessage
-from src.models.submit import SubmitOutcome, SubmitStatus
+from src.models.submit import SubmitOutcome, SubmitStatus, derive_run_id
 from tests.helpers import (
     ACCEPTED,
     InMemoryRedis,
@@ -437,7 +436,7 @@ def test_run_retries_with_the_same_run_id_until_acknowledged():
     assert result.outcome == "accepted"
     run_ids = {request.run_id for request in client.requests}
     assert len(client.requests) == 3 and len(run_ids) == 1
-    UUID(run_ids.pop())  # minted per delivered message, a real uuid
+    assert run_ids.pop() == derive_run_id(AUTOMATION_ID, HISTORY_ID)
     # Each attempt re-won the provisional claim it released on failure.
     assert claims == [client.requests[0].run_id] * 3
     assert redis.values[COOLDOWN_KEY] == COOLDOWN_ARMED_VALUE
@@ -445,15 +444,25 @@ def test_run_retries_with_the_same_run_id_until_acknowledged():
     assert client.requests[1].gate_flags["idempotency"] == "ambiguous"
 
 
-def test_each_delivery_mints_a_new_run_id():
+def test_run_id_is_derived_per_event_not_per_delivery():
+    """Every delivery of one event carries the same run_id (that is what lets a
+    redelivery re-enter its own claim); distinct events never share one."""
     client = ScriptedSubmitClient(ACCEPTED)
-    pipeline = build_test_pipeline(redis=InMemoryRedis(), submit_client=client)
-
-    pipeline.run(message(), cancelled=threading.Event())
+    # Fresh Redis per delivery: each one reaches submit, as after a key loss.
+    build_test_pipeline(redis=InMemoryRedis(), submit_client=client).run(
+        message(), cancelled=threading.Event()
+    )
+    build_test_pipeline(redis=InMemoryRedis(), submit_client=client).run(
+        message(), cancelled=threading.Event()
+    )
     other_event = {**MESSAGE["alert"], "history_id": "evt-other", "site": "eu-west-1"}
-    pipeline.run(message(alert=other_event), cancelled=threading.Event())
+    build_test_pipeline(redis=InMemoryRedis(), submit_client=client).run(
+        message(alert=other_event), cancelled=threading.Event()
+    )
 
-    assert client.requests[0].run_id != client.requests[1].run_id
+    first, redelivered, other = (request.run_id for request in client.requests)
+    assert first == redelivered == derive_run_id(AUTOMATION_ID, HISTORY_ID)
+    assert other == derive_run_id(AUTOMATION_ID, "evt-other") != first
 
 
 def test_shutdown_during_backoff_abandons_without_another_attempt():
@@ -652,6 +661,103 @@ def test_someone_elses_already_submitted_still_releases():
     pipeline.process_once(message(), run_id=RUN_ID)
 
     assert COOLDOWN_KEY not in redis.values
+
+
+def test_stale_already_submitted_with_our_run_id_releases_rather_than_rearming():
+    """A fresh claim, a first attempt, and already_submitted: nothing says the
+    row is recent (an offset replay, a copy after the idempotency TTL). Arming
+    would restart the entity's whole window and suppress the events a replay
+    exists to recover."""
+    redis = InMemoryRedis()
+    pipeline = build_test_pipeline(
+        redis=redis,
+        submit_client=ScriptedSubmitClient(
+            acknowledged(SubmitStatus.ALREADY_SUBMITTED, run_id=RUN_ID)
+        ),
+    )
+
+    result = pipeline.process_once(message(), run_id=RUN_ID)
+
+    assert result.outcome == "already_submitted"
+    assert COOLDOWN_KEY not in redis.values
+
+
+# -- crash redelivery (VAULT C11 follow-up 1) ----------------------------------
+
+
+class ProcessKilled(BaseException):
+    """Stands in for SIGKILL/OOM: nothing after it runs in the dying consumer."""
+
+
+def redis_left_by_a_crash_mid_submit():
+    """Redis as a consumer killed mid-submit leaves it: idem `pending` and a
+    provisional cooldown claim holding the dead delivery's run_id.
+
+    Snapshotted at the submit call — the in-process `release` on unwind never
+    runs under SIGKILL. Returns the surviving Redis and the run_id the dead
+    delivery submitted with (an API row it reached carries the same id).
+    """
+    redis = InMemoryRedis()
+    left = {}
+
+    def killed(request):
+        left["values"], left["ttls"] = dict(redis.values), dict(redis.ttls)
+        left["run_id"] = request.run_id
+        raise ProcessKilled
+
+    dying = build_test_pipeline(
+        redis=redis, submit_client=ScriptedSubmitClient(on_submit=killed)
+    )
+    with pytest.raises(ProcessKilled):
+        dying.run(message(), cancelled=threading.Event())
+
+    survivor = InMemoryRedis()
+    survivor.values, survivor.ttls = left["values"], left["ttls"]
+    assert survivor.values[IDEM_KEY] == "pending"
+    assert survivor.values[COOLDOWN_KEY] == left["run_id"]  # orphaned claim
+    return survivor, left["run_id"]
+
+
+def test_redelivery_after_a_crash_mid_submit_re_enters_its_claim_and_runs():
+    """The event must not be suppressed by the claim its own dead delivery
+    left — with a short `session.timeout.ms` the redelivery arrives well
+    inside that claim's 30s."""
+    redis, _ = redis_left_by_a_crash_mid_submit()
+    auditor = RecordingAuditor()
+    client = ScriptedSubmitClient(ACCEPTED)
+    redelivery = build_test_pipeline(
+        redis=redis, submit_client=client, suppression_auditor=auditor
+    )
+
+    result = redelivery.run(message(), cancelled=threading.Event())
+
+    assert result.outcome == "accepted"
+    assert auditor.rows == []
+    assert len(client.requests) == 1
+    assert redis.values[COOLDOWN_KEY] == COOLDOWN_ARMED_VALUE
+    assert redis.ttls[COOLDOWN_KEY] == 300
+
+
+def test_redelivery_after_a_crash_past_acceptance_arms_the_cooldown():
+    """The dead delivery's submit was accepted before the kill: the
+    redelivery re-enters the claim, gets already_submitted for the same
+    run_id, and arms the cooldown the dead delivery never could."""
+    redis, dead_run_id = redis_left_by_a_crash_mid_submit()
+    auditor = RecordingAuditor()
+    client = ScriptedSubmitClient(
+        acknowledged(SubmitStatus.ALREADY_SUBMITTED, run_id=dead_run_id)
+    )
+    redelivery = build_test_pipeline(
+        redis=redis, submit_client=client, suppression_auditor=auditor
+    )
+
+    result = redelivery.run(message(), cancelled=threading.Event())
+
+    assert result.outcome == "already_submitted"
+    assert auditor.rows == []
+    assert client.requests[0].run_id == dead_run_id
+    assert redis.values[COOLDOWN_KEY] == COOLDOWN_ARMED_VALUE
+    assert redis.ttls[COOLDOWN_KEY] == 300
 
 
 def test_unsendable_message_is_skipped_loudly_and_releases_its_claim(caplog):

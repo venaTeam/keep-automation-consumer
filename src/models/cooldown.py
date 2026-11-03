@@ -25,6 +25,10 @@ class CooldownDecision:
     next_eligible_at: Optional[datetime] = None
     missing_fields: tuple[str, ...] = ()
     gate_flags: dict[str, str] = field(default_factory=dict)
+    # CLAIMED by re-entering a claim this event's run_id already held: a
+    # delivery of the same event claimed within the provisional TTL, so a run
+    # it may have started is recent (contracts §Submit, `already_submitted`).
+    reentered: bool = False
 
     @property
     def should_submit(self) -> bool:

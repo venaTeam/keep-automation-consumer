@@ -93,7 +93,7 @@ class InMemoryRedis:
                 if current == args[0] or current is None:
                     self.values[key] = args[0]
                     self.ttls[key] = int(args[1])
-                    return 1
+                    return 2 if current is not None else 1
                 return 0
             if self.values.get(key) != args[0]:
                 return 0
