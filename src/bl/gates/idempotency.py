@@ -85,6 +85,10 @@ class IdempotencyDecision:
     outcome: IdempotencyOutcome
     key: str
     gate_flags: dict[str, str] = field(default_factory=dict)
+    # Why the gate was skipped (`FAIL_OPEN` only). C11 reads it to skip the
+    # cooldown gate too when Redis is the reason (spec §6.3 "submit without
+    # gates"), instead of paying a second socket timeout per message.
+    reason: Optional[str] = None
 
     @property
     def should_submit(self) -> bool:
@@ -295,7 +299,9 @@ class IdempotencyGate:
         flags = {"idempotency": "skipped" if reason else outcome.value}
         if reason:
             flags["reason"] = reason
-        return IdempotencyDecision(outcome=outcome, key=key, gate_flags=flags)
+        return IdempotencyDecision(
+            outcome=outcome, key=key, gate_flags=flags, reason=reason
+        )
 
 
 def _as_text(value: Any) -> Optional[str]:

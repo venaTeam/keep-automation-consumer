@@ -11,8 +11,25 @@ KAFKA_BACKPRESSURE_POLL_TIMEOUT_SECONDS = config(
     "KAFKA_BACKPRESSURE_POLL_TIMEOUT_SECONDS", default="0.1", cast=float
 )
 
-# Worker pool sized toward ~200 submits/s (spec §2.3). Config knob only in the
-# skeleton — the pool itself arrives with submit orchestration (C11).
+# How often settled offsets are committed (asynchronously, from the poll
+# thread). A commit is a broker round trip; one per message at ~200/s would
+# spend the poll thread on commits. Shutdown and revoke always commit
+# synchronously regardless of this interval.
+KAFKA_COMMIT_INTERVAL_SECONDS = max(
+    0.0, config("KAFKA_COMMIT_INTERVAL_SECONDS", default="1.0", cast=float)
+)
+
+# Commits are contiguous per partition, so one message stuck retrying holds back
+# every settled message behind it. Past this many uncommitted offsets the
+# partition is paused (only that one) until the stuck message settles — bounds
+# both redelivery after a crash and how far one automation can run ahead of it.
+MAX_UNCOMMITTED_OFFSETS_PER_PARTITION = max(
+    1, config("MAX_UNCOMMITTED_OFFSETS_PER_PARTITION", default="1000", cast=int)
+)
+
+# Worker pool sized toward ~200 short submit-acknowledgement round trips/s
+# (spec §2.3, §5.2). Workers also hold messages that are backing off after a
+# failed submit; when every slot is busy, partitions pause and polling goes on.
 WORKER_POOL_SIZE = max(1, config("WORKER_POOL_SIZE", default="200", cast=int))
 
 # Ports (event-handler convention: health 8092, metrics 8094).
@@ -68,4 +85,46 @@ REDIS_BREAKER_OPEN_SECONDS = max(
 # The metric counts every failure; only the logging is budgeted.
 REDIS_ERROR_LOG_INTERVAL_SECONDS = max(
     0.0, config("REDIS_ERROR_LOG_INTERVAL_SECONDS", default="30.0", cast=float)
+)
+
+# Automation API — `POST /internal/submit` (contracts §Submit, §Environment).
+# Required: the consumer cannot do its job without it, so startup fails fast.
+AUTOMATION_API_URL = config("AUTOMATION_API_URL", default="")
+# Internal-tier service token (A0), sent as `Authorization: Bearer`. Same env
+# name as keep-automation-api. Never logged.
+INTERNAL_SERVICE_TOKEN = config("INTERNAL_SERVICE_TOKEN", default="")
+
+# Submit acknowledges in seconds (early ack, spec §7.1). Clamped so connect +
+# write + read (httpx applies the timeout per phase) stays under the 30s
+# provisional cooldown TTL even at the caps (5 + 12 + 12 = 29s, spec §7.6): an
+# `accepted` that arrives after the claim expired cannot arm the cooldown.
+AUTOMATION_API_CONNECT_TIMEOUT_SECONDS = min(
+    5.0,
+    max(0.1, config("AUTOMATION_API_CONNECT_TIMEOUT_SECONDS", default="2.0", cast=float)),
+)
+AUTOMATION_API_TIMEOUT_SECONDS = min(
+    12.0,
+    max(1.0, config("AUTOMATION_API_TIMEOUT_SECONDS", default="10.0", cast=float)),
+)
+
+# Bound on waiting for in-flight submits when partitions are revoked: one
+# attempt's worst case (connect + write + read) plus margin. Far below
+# `max.poll.interval.ms`. Shutdown drains the same work, so the pod's
+# `terminationGracePeriodSeconds` must exceed this by a few seconds (~35s+ at
+# the defaults; the k8s default of 30s is too short).
+IN_FLIGHT_DRAIN_TIMEOUT_SECONDS = (
+    AUTOMATION_API_CONNECT_TIMEOUT_SECONDS + 2 * AUTOMATION_API_TIMEOUT_SECONDS + 5.0
+)
+
+# Backoff between attempts of an unacknowledged submit (429 capacity, 5xx,
+# transport error). Capped exponential with jitter; retries continue until the
+# message settles, the consumer stops, or its partition is revoked.
+# Floored above zero: 200 workers retrying with no delay is a storm against
+# exactly the API that is struggling.
+SUBMIT_RETRY_BACKOFF_INITIAL_SECONDS = max(
+    0.1, config("SUBMIT_RETRY_BACKOFF_INITIAL_SECONDS", default="1.0", cast=float)
+)
+SUBMIT_RETRY_BACKOFF_MAX_SECONDS = max(
+    SUBMIT_RETRY_BACKOFF_INITIAL_SECONDS,
+    config("SUBMIT_RETRY_BACKOFF_MAX_SECONDS", default="30.0", cast=float),
 )

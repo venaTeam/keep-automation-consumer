@@ -1,4 +1,9 @@
-"""Best-effort owned cooldown decisions; C11 wires them into submit flow."""
+"""Best-effort owned cooldown decisions, wired into the submit flow by C11.
+
+`gate_flags` keys are namespaced (`cooldown`, `cooldown_reason`,
+`cooldown_missing_fields`) so they merge with the idempotency gate's flags into
+the submit request's flat `gate_flags` without colliding (contracts §Submit).
+"""
 
 import logging
 import threading
@@ -129,6 +134,28 @@ class CooldownGate:
                 reason=REASON_REDIS_UNAVAILABLE,
             )
 
+        if not claimed:
+            # The run_id is reused across this delivery's retries, so a key
+            # holding it is our own earlier claim whose release (or claim
+            # reply) was lost to a Redis blip. Suppressing on it would make the
+            # message suppress itself and be committed with nothing submitted.
+            try:
+                claimed = self._lifecycle.reclaim(
+                    client,
+                    key=key,
+                    owner_token=run_id,
+                    ttl_seconds=COOLDOWN_PROVISIONAL_TTL_SECONDS,
+                )
+            except Exception:  # noqa: BLE001 - unsure whose claim it is: run
+                self._redis_failed(RedisOperation.COOLDOWN_RECLAIM)
+                return self._decide(
+                    CooldownOutcome.FAIL_OPEN,
+                    key=key,
+                    entity_hash=entity_hash,
+                    cooldown_seconds=seconds,
+                    reason=REASON_REDIS_UNAVAILABLE,
+                )
+
         if claimed:
             return self._decide(
                 CooldownOutcome.CLAIMED,
@@ -162,6 +189,20 @@ class CooldownGate:
             cooldown_seconds=seconds,
             eligible_again_in_seconds=remaining,
             next_eligible_at=next_eligible,
+        )
+
+    def skip_unavailable(self, message: MatchedAlertMessage) -> CooldownDecision:
+        """Fail open without a Redis call.
+
+        For when the idempotency gate has just found Redis unavailable (error or
+        open breaker): the cooldown gate has no breaker of its own, so claiming
+        anyway would charge a second socket timeout to every message of an
+        outage. The decision is recorded exactly like a Redis-failed claim.
+        """
+        if message.cooldown is None:
+            return self._decide(CooldownOutcome.DISABLED)
+        return self._decide(
+            CooldownOutcome.FAIL_OPEN, reason=REASON_REDIS_UNAVAILABLE
         )
 
     def activate(self, decision: CooldownDecision) -> bool:
@@ -284,9 +325,9 @@ class CooldownGate:
         cooldown_decision_counters[outcome].inc()
         flags = {"cooldown": "skipped" if reason else outcome.value}
         if reason:
-            flags["reason"] = reason
+            flags["cooldown_reason"] = reason
         if missing_fields:
-            flags["missing_fields"] = ",".join(missing_fields)
+            flags["cooldown_missing_fields"] = ",".join(missing_fields)
         return CooldownDecision(
             outcome=outcome,
             key=key,

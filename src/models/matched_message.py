@@ -32,10 +32,43 @@ class MatchedAlertMessage:
     @classmethod
     def from_bytes(cls, raw: bytes) -> "MatchedAlertMessage":
         data = json.loads(raw)
-        return cls(
+        message = cls(
             tenant_id=data["tenant_id"],
             alert=data["alert"],
             automation_id=data["automation_id"],
             matched_m=data.get("matched_m"),
             cooldown=data.get("cooldown"),
         )
+        message.validate()
+        return message
+
+    def validate(self) -> None:
+        """Reject a message no submit could ever carry (contracts §Matched message).
+
+        A null tenant/automation or a missing `history_id` is refused by the
+        API's request validation on every attempt, and NULL would not dedup in
+        the run table's unique key either. Retrying it would stall its
+        partition forever, so it is poison: rejected here, skipped by the
+        consumer.
+        """
+        problems = []
+        if not _non_empty_str(self.tenant_id):
+            problems.append("tenant_id")
+        if not _non_empty_str(self.automation_id):
+            problems.append("automation_id")
+        if not isinstance(self.alert, dict):
+            problems.append("alert")
+        elif not _non_empty_str(self.history_id):
+            problems.append("alert.history_id")
+        if problems:
+            raise MalformedMessage(problems)
+
+
+class MalformedMessage(ValueError):
+    def __init__(self, fields: list[str]) -> None:
+        super().__init__(f"invalid or missing: {', '.join(fields)}")
+        self.fields = fields
+
+
+def _non_empty_str(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
