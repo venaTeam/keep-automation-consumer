@@ -11,14 +11,14 @@ Only composition-root wiring changes when D17's client replaces the stub.
 """
 
 import logging
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 from src.core.safe_logging import safe_log_value
 
 logger = logging.getLogger(__name__)
 
-# `automation_runs.suppression_reason` values (contracts §DB enums). Only
-# `duplicate` is reachable from C9; `cooldown` is armed by C10.
+# `automation_runs.suppression_reason` values (contracts §DB enums): `duplicate`
+# from the idempotency gate, `cooldown` from the cooldown gate.
 REASON_DUPLICATE = "duplicate"
 REASON_COOLDOWN = "cooldown"
 
@@ -33,6 +33,7 @@ class SuppressionAuditor(Protocol):
         fingerprint: Optional[str],
         reason: str,
         gate_flags: Optional[dict[str, str]] = None,
+        detail: Optional[dict[str, Any]] = None,
     ) -> None: ...
 
 
@@ -53,14 +54,20 @@ class LoggingSuppressionAuditor:
         fingerprint: Optional[str],
         reason: str,
         gate_flags: Optional[dict[str, str]] = None,
+        detail: Optional[dict[str, Any]] = None,
     ) -> None:
+        # `detail` carries reason-specific context the row will need — for a
+        # cooldown suppression, the entity hash and "eligible again in at least
+        # T" (spec §5.2 step 2).
         logger.info(
             "automations: suppressed run (audit pending D17) tenant_id=%s "
-            "automation_id=%s history_id=%s fingerprint=%s reason=%s gate_flags=%s",
+            "automation_id=%s history_id=%s fingerprint=%s reason=%s gate_flags=%s "
+            "detail=%s",
             safe_log_value(tenant_id),
             safe_log_value(automation_id),
             safe_log_value(history_id),
             safe_log_value(fingerprint),
             safe_log_value(reason),
             safe_log_value(gate_flags),
+            safe_log_value(detail),
         )

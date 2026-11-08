@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "keep-automation-consumer"
 version = "0.1.0"
-description = "Keep Automations consumer — reads the matched-alerts topic, gates (Redis), and calls the automation API submit endpoint. C8: service skeleton (consume + log)."
+description = "Keep Automations consumer — reads the matched-alerts topic, gates (Redis), and calls the automation API submit endpoint. Commits the matched-topic offset only after an API-acknowledged submit."
 authors = ["Keep"]
 readme = "README.md"
 packages = [{ include = "src" }]
@@ -15,10 +15,11 @@ confluent-kafka = "^2.5.0"
 prometheus-client = "^0.21.0"
 python-dotenv = "^0.21.1"
 redis = "^5.2.0"
+httpx = "^0.28.1"
+certifi = ">=2024.2.2"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"
-httpx = "^0.28.1"
 
 [build-system]
 requires = ["poetry-core"]

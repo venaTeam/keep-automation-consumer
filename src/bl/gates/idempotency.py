@@ -47,7 +47,6 @@ from src.config.consts import (
 from src.core.metrics import (
     RedisOperation,
     idempotency_decision_counters,
-    idempotency_fail_open_counters,
     redis_error_counters,
 )
 from src.core.safe_logging import safe_log_value
@@ -87,6 +86,10 @@ class IdempotencyDecision:
     outcome: IdempotencyOutcome
     key: str
     gate_flags: dict[str, str] = field(default_factory=dict)
+    # Why the gate was skipped (`FAIL_OPEN` only). C11 reads it to skip the
+    # cooldown gate too when Redis is the reason (spec §6.3 "submit without
+    # gates"), instead of paying a second socket timeout per message.
+    reason: Optional[str] = None
 
     @property
     def should_submit(self) -> bool:
@@ -116,7 +119,6 @@ class IdempotencyGate:
         self._breaker_open_until = 0.0
         self._half_open_probe_in_flight = False
         self._next_error_log_at = 0.0
-        self._next_missing_id_log_at = 0.0
         self._breaker_lock = threading.Lock()
 
     # -- circuit breaker ---------------------------------------------------
@@ -188,24 +190,18 @@ class IdempotencyGate:
         key = idempotency_key(history_id, message.automation_id)
 
         if not history_id:
-            # The message model maps B5's `alert.id` to history_id. Without it the key would collapse to
+            # The matcher stamps `history_id` on every alert (contracts §Alert
+            # payload: always present). Without it the key would collapse to
             # `idem:None:{automation_id}` and one automation's whole event
             # stream would share a single gate — the first event suppressing
             # every later one. Fail open instead: the DB constraint still
             # dedups, and submit is the safe side.
-            now = self._clock()
-            with self._breaker_lock:
-                should_log = now >= self._next_missing_id_log_at
-                if should_log:
-                    self._next_missing_id_log_at = now + REDIS_ERROR_LOG_INTERVAL_SECONDS
-            if should_log:
-                logger.warning(
-                    "automations: matched message has no alert.id; idempotency gate skipped "
-                    "(automation_id=%s tenant_id=%s; further warnings suppressed for %ss)",
-                    safe_log_value(message.automation_id),
-                    safe_log_value(message.tenant_id),
-                    REDIS_ERROR_LOG_INTERVAL_SECONDS,
-                )
+            logger.warning(
+                "automations: matched message has no alert.id "
+                "(automation_id=%s tenant_id=%s); idempotency gate skipped",
+                safe_log_value(message.automation_id),
+                safe_log_value(message.tenant_id),
+            )
             return self._decide(
                 IdempotencyOutcome.FAIL_OPEN, key, REASON_MISSING_HISTORY_ID
             )
@@ -304,8 +300,9 @@ class IdempotencyGate:
         flags = {"idempotency": "skipped" if reason else outcome.value}
         if reason:
             flags["reason"] = reason
-            idempotency_fail_open_counters[reason].inc()
-        return IdempotencyDecision(outcome=outcome, key=key, gate_flags=flags)
+        return IdempotencyDecision(
+            outcome=outcome, key=key, gate_flags=flags, reason=reason
+        )
 
 
 def _as_text(value: Any) -> Optional[str]:

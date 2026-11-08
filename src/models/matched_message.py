@@ -34,10 +34,40 @@ class MatchedAlertMessage:
     @classmethod
     def from_bytes(cls, raw: bytes) -> "MatchedAlertMessage":
         data = json.loads(raw)
-        return cls(
+        message = cls(
             tenant_id=data["tenant_id"],
             alert=data["alert"],
             automation_id=data["automation_id"],
             matched_m=data.get("matched_m"),
             cooldown=data.get("cooldown"),
         )
+        message.validate()
+        return message
+
+    def validate(self) -> None:
+        """Reject a message no submit could ever carry (contracts §Matched message).
+
+        A null tenant or automation is refused by the API's request validation.
+        Missing `alert.id` is allowed through so the idempotency gate can fail
+        open and expose the degraded delivery with its `missing_history_id`
+        reason; the gate must never build a shared key from a missing ID.
+        """
+        problems = []
+        if not _non_empty_str(self.tenant_id):
+            problems.append("tenant_id")
+        if not _non_empty_str(self.automation_id):
+            problems.append("automation_id")
+        if not isinstance(self.alert, dict):
+            problems.append("alert")
+        if problems:
+            raise MalformedMessage(problems)
+
+
+class MalformedMessage(ValueError):
+    def __init__(self, fields: list[str]) -> None:
+        super().__init__(f"invalid or missing: {', '.join(fields)}")
+        self.fields = fields
+
+
+def _non_empty_str(value: object) -> bool:
+    return isinstance(value, str) and bool(value)

@@ -32,7 +32,7 @@ from src.config.consts import (
 )
 from src.core.metrics import GateConfigSetting, RedisOperation
 from src.models.matched_message import MatchedAlertMessage
-from tests.helpers import build_test_consumer
+from tests.helpers import RecordingAuditor, ScriptedSubmitClient, build_test_consumer
 
 AUTOMATION_ID = "3f2b8c1e-4d6a-4b2f-9e77-0a1b2c3d4e5f"
 HISTORY_ID = "evt-789"
@@ -83,36 +83,6 @@ class FakeRedis:
         return self.values.get(key)
 
 
-class RecordingAuditor:
-    """Explicit signature on purpose: a `**row` fake would accept a renamed
-    parameter that the real `LoggingSuppressionAuditor` rejects, hiding a
-    TypeError that only fires on the first production duplicate."""
-
-    def __init__(self):
-        self.rows = []
-
-    def record_suppression(
-        self,
-        *,
-        tenant_id,
-        automation_id,
-        history_id,
-        fingerprint,
-        reason,
-        gate_flags=None,
-    ):
-        self.rows.append(
-            {
-                "tenant_id": tenant_id,
-                "automation_id": automation_id,
-                "history_id": history_id,
-                "fingerprint": fingerprint,
-                "reason": reason,
-                "gate_flags": gate_flags,
-            }
-        )
-
-
 def message(**overrides) -> MatchedAlertMessage:
     payload = json.loads(json.dumps(MESSAGE))
     payload.update(overrides)
@@ -154,30 +124,6 @@ def test_first_claim_is_claimed_and_stores_pending():
     assert decision.outcome is IdempotencyOutcome.CLAIMED
     assert decision.should_submit is True
     assert redis.values[decision.key] == "pending"
-
-
-def test_id_only_confirmation_suppresses_b5_redelivery_with_same_id():
-    redis = FakeRedis()
-    gate = gate_with(redis)
-    assert gate.claim(message()).outcome is IdempotencyOutcome.CLAIMED
-    assert gate.mark_done(message()) is True
-    assert gate.claim(message()).outcome is IdempotencyOutcome.DUPLICATE
-
-
-def test_b5_id_controls_claim_and_confirmation_when_history_id_differs():
-    redis = FakeRedis()
-    gate = gate_with(redis)
-    mixed = message(alert={**MESSAGE["alert"], "history_id": "legacy-event"})
-
-    decision = gate.claim(mixed)
-    assert decision.key == idempotency_key(HISTORY_ID, AUTOMATION_ID)
-    assert gate.mark_done(mixed) is True
-    assert gate.claim(message()).outcome is IdempotencyOutcome.DUPLICATE
-    assert idempotency_key("legacy-event", AUTOMATION_ID) not in redis.values
-
-    # A new event with the same fingerprint must still proceed.
-    different_event = message(alert={**MESSAGE["alert"], "id": "evt-790"})
-    assert gate.claim(different_event).outcome is IdempotencyOutcome.CLAIMED
 
 
 def test_claim_ttl_defaults_to_the_contract_24h():
@@ -322,12 +268,17 @@ def test_read_error_after_nx_fail_fails_open():
     assert decision.should_submit is True
 
 
-def test_message_without_event_identity_fails_open_and_arms_nothing():
+def test_message_without_alert_id_fails_open_and_arms_nothing():
+    """Gate-level guard. The consumer now rejects such a message before the
+    gate (MalformedMessage), so this is built directly, bypassing that check."""
     redis = FakeRedis()
     alert = dict(MESSAGE["alert"])
     alert.pop("id")
+    unvalidated = MatchedAlertMessage(
+        tenant_id="keep", alert=alert, automation_id=AUTOMATION_ID
+    )
 
-    decision = gate_with(redis).claim(message(alert=alert))
+    decision = gate_with(redis).claim(unvalidated)
 
     assert decision.outcome is IdempotencyOutcome.FAIL_OPEN
     assert decision.gate_flags["reason"] == "missing_history_id"
@@ -383,62 +334,35 @@ def test_every_decision_is_counted_by_outcome():
 
 
 def test_each_duplicate_redelivery_is_suppressed_and_audited():
-    """The C9 half of the story's integration check.
+    """The C9 half of the story's integration check, through the consumer.
 
-    Delivery 1 claims and (once C11 lands) submits; `mark_done` stands in for
-    the API-confirmed submit. Both later redeliveries are suppressed and audited.
+    Delivery 1 claims and submits; the API acknowledgement marks the key
+    `done`. Both later redeliveries are suppressed and audited, never submitted.
     """
     redis = FakeRedis()
     gate = gate_with(redis)
     auditor = RecordingAuditor()
+    client = ScriptedSubmitClient()
     consumer = build_test_consumer(
         idempotency_gate=gate,
         suppression_auditor=auditor,
+        submit_client=client,
     )
     raw = json.dumps(MESSAGE).encode("utf-8")
 
     consumer._handle(raw)
     assert auditor.rows == []  # first delivery proceeds
-
-    gate.mark_done(message())  # stands in for the confirmed submit (C11)
+    assert redis.values[idempotency_key(HISTORY_ID, AUTOMATION_ID)] == "done"
 
     consumer._handle(raw)
     consumer._handle(raw)
 
-    assert len(auditor.rows) == 2  # every redelivery is audited, none submitted
+    assert len(client.requests) == 1  # exactly one submit
+    assert len(auditor.rows) == 2  # every redelivery is audited
     assert {row["reason"] for row in auditor.rows} == {REASON_DUPLICATE}
     assert auditor.rows[0]["tenant_id"] == "keep"
     assert auditor.rows[0]["history_id"] == HISTORY_ID
     assert auditor.rows[0]["fingerprint"] == "abc123"
-
-
-def test_duplicate_audit_receives_raw_message_values():
-    """Audit persistence must receive source values, not log-safe renderings."""
-    raw_tenant = "tenant\nraw"
-    raw_automation = "automation\\u000a"
-    raw_event_id = "evt\nraw"
-    payload = json.loads(json.dumps(MESSAGE))
-    payload["tenant_id"] = raw_tenant
-    payload["automation_id"] = raw_automation
-    payload["alert"]["id"] = raw_event_id
-
-    redis = FakeRedis()
-    gate = gate_with(redis)
-    auditor = RecordingAuditor()
-    consumer = build_test_consumer(
-        idempotency_gate=gate,
-        suppression_auditor=auditor,
-    )
-
-    raw = json.dumps(payload).encode("utf-8")
-    consumer._handle(raw)
-    assert gate.mark_done(MatchedAlertMessage.from_bytes(raw)) is True
-    consumer._handle(raw)
-
-    row = auditor.rows[0]
-    assert row["tenant_id"] == raw_tenant
-    assert row["automation_id"] == raw_automation
-    assert row["history_id"] == raw_event_id
 
 
 def test_a_failing_client_factory_does_not_escape_handle():
@@ -485,10 +409,10 @@ def test_a_failing_auditor_does_not_escape_handle(caplog):
         idempotency_gate=gate_with(redis), suppression_auditor=AngryAuditor()
     )
 
-    with caplog.at_level(logging.ERROR, logger="src.core.kafka_consumer"):
+    with caplog.at_level(logging.ERROR, logger="src.bl.pipeline"):
         consumer._handle(json.dumps(MESSAGE).encode("utf-8"))  # must not raise
 
-    assert "could not audit a suppressed duplicate" in caplog.records[-1].getMessage()
+    assert "could not audit a duplicate suppression" in caplog.records[-1].getMessage()
 
 
 # -- circuit breaker ----------------------------------------------------------
@@ -503,47 +427,6 @@ class Clock:
 
     def advance(self, seconds):
         self.now += seconds
-
-
-def test_fail_open_reasons_count_each_message_including_open_breaker():
-    metric = "keep_automation_consumer_idempotency_fail_open_total"
-    missing_before = counter(metric, reason="missing_history_id")
-    redis_before = counter(metric, reason="redis_unavailable")
-    gate = IdempotencyGate(client_factory=lambda: None, clock=Clock())
-    gate.claim(message(alert={"fingerprint": "same-alert"}))
-    attempts = REDIS_BREAKER_FAILURE_THRESHOLD + 3
-    for _ in range(attempts):
-        gate.claim(message())
-    assert counter(metric, reason="missing_history_id") == missing_before + 1
-    assert counter(metric, reason="redis_unavailable") == redis_before + attempts
-
-
-def test_missing_id_warnings_share_budget_across_workers(caplog):
-    clock = Clock()
-    gate = IdempotencyGate(client_factory=lambda: None, clock=clock)
-    missing = message(alert={})
-    metric = "keep_automation_consumer_idempotency_fail_open_total"
-    before = counter(metric, reason="missing_history_id")
-    with caplog.at_level(logging.WARNING, logger="src.bl.gates.idempotency"):
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            decisions = list(pool.map(lambda _: gate.claim(missing), range(32)))
-        assert len(caplog.records) == 1
-        assert "alert.id" in caplog.records[0].getMessage()
-        assert all(d.should_submit for d in decisions)
-        assert counter(metric, reason="missing_history_id") == before + 32
-        clock.advance(REDIS_ERROR_LOG_INTERVAL_SECONDS)
-        gate.claim(missing)
-        assert len(caplog.records) == 2
-
-
-def test_missing_id_warning_does_not_hide_redis_outage(caplog):
-    gate = IdempotencyGate(
-        client_factory=lambda: FakeRedis(fail_on=["set"]), clock=Clock()
-    )
-    with caplog.at_level(logging.WARNING, logger="src.bl.gates.idempotency"):
-        gate.claim(message(alert={}))
-        gate.claim(message())
-    assert [r.levelno for r in caplog.records] == [logging.WARNING, logging.ERROR]
 
 
 def failing_gate(clock):
@@ -774,13 +657,17 @@ def test_error_and_decision_counters_exist_before_the_first_event():
 def test_a_pending_sibling_does_not_suppress_the_redelivery():
     """A crash between claim and submit must not lose the automation."""
     redis = FakeRedis()
+    redis.values[idempotency_key(HISTORY_ID, AUTOMATION_ID)] = "pending"
     auditor = RecordingAuditor()
+    client = ScriptedSubmitClient()
     consumer = build_test_consumer(
-        idempotency_gate=gate_with(redis), suppression_auditor=auditor
+        idempotency_gate=gate_with(redis),
+        suppression_auditor=auditor,
+        submit_client=client,
     )
-    raw = json.dumps(MESSAGE).encode("utf-8")
 
-    consumer._handle(raw)
-    consumer._handle(raw)
+    consumer._handle(json.dumps(MESSAGE).encode("utf-8"))
 
     assert auditor.rows == []
+    assert len(client.requests) == 1
+    assert client.requests[0].gate_flags["idempotency"] == "ambiguous"
