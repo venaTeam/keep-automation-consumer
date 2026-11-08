@@ -65,6 +65,7 @@ from src.core.metrics import (
     submit_rejection_counters,
     submit_rejections,
 )
+from src.core.safe_logging import safe_log_value
 from src.models.cooldown import CooldownDecision, CooldownOutcome
 from src.models.idempotency import IdempotencyOutcome
 from src.models.matched_message import MatchedAlertMessage
@@ -291,9 +292,9 @@ class SubmitPipeline:
             logger.warning(
                 "automations: accepted run could not arm its cooldown "
                 "(claim no longer owned) tenant_id=%s automation_id=%s run_id=%s",
-                message.tenant_id,
-                message.automation_id,
-                run_id,
+                safe_log_value(message.tenant_id),
+                safe_log_value(message.automation_id),
+                safe_log_value(run_id),
             )
 
     @staticmethod
@@ -324,10 +325,10 @@ class SubmitPipeline:
             "message, its automation will NOT run tenant_id=%s automation_id=%s "
             "history_id=%s run_id=%s",
             label if label == "unsendable" else f"http {label}",
-            message.tenant_id,
-            message.automation_id,
-            message.history_id,
-            run_id,
+            safe_log_value(message.tenant_id),
+            safe_log_value(message.automation_id),
+            safe_log_value(message.history_id),
+            safe_log_value(run_id),
         )
 
     def _audit(
@@ -355,10 +356,10 @@ class SubmitPipeline:
             logger.exception(
                 "automations: could not audit a %s suppression "
                 "tenant_id=%s automation_id=%s history_id=%s",
-                reason,
-                message.tenant_id,
-                message.automation_id,
-                message.history_id,
+                safe_log_value(reason),
+                safe_log_value(message.tenant_id),
+                safe_log_value(message.automation_id),
+                safe_log_value(message.history_id),
             )
 
     def _log_attempt_error(self, message: MatchedAlertMessage) -> None:
@@ -372,9 +373,9 @@ class SubmitPipeline:
             logger.exception(
                 "automations: submit attempt raised; claim released, retrying "
                 "tenant_id=%s automation_id=%s history_id=%s",
-                message.tenant_id,
-                message.automation_id,
-                message.history_id,
+                safe_log_value(message.tenant_id),
+                safe_log_value(message.automation_id),
+                safe_log_value(message.history_id),
             )
 
     def _abandon(self, message: MatchedAlertMessage, reason: AbandonReason) -> None:
@@ -383,9 +384,9 @@ class SubmitPipeline:
             "automations: message handed back to Kafka unsettled (%s) "
             "tenant_id=%s automation_id=%s history_id=%s",
             reason.value,
-            message.tenant_id,
-            message.automation_id,
-            message.history_id,
+            safe_log_value(message.tenant_id),
+            safe_log_value(message.automation_id),
+            safe_log_value(message.history_id),
         )
 
     def _log_retry(
@@ -409,9 +410,9 @@ class SubmitPipeline:
             result.outcome,
             delay,
             attempt,
-            message.tenant_id,
-            message.automation_id,
-            message.history_id,
+            safe_log_value(message.tenant_id),
+            safe_log_value(message.automation_id),
+            safe_log_value(message.history_id),
         )
 
 

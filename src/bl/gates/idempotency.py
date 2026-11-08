@@ -49,6 +49,7 @@ from src.core.metrics import (
     idempotency_decision_counters,
     redis_error_counters,
 )
+from src.core.safe_logging import safe_log_value
 from src.models.idempotency import IdempotencyOutcome
 from src.models.matched_message import MatchedAlertMessage
 
@@ -174,14 +175,14 @@ class IdempotencyGate:
                 "automations: idempotency %s failed for key=%s; failing open "
                 "(further tracebacks suppressed for %ss)",
                 operation.value,
-                key,
+                safe_log_value(key),
                 REDIS_ERROR_LOG_INTERVAL_SECONDS,
             )
         else:
             logger.debug(
                 "automations: idempotency %s failed for key=%s",
                 operation.value,
-                key,
+                safe_log_value(key),
             )
 
     def claim(self, message: MatchedAlertMessage) -> IdempotencyDecision:
@@ -196,10 +197,10 @@ class IdempotencyGate:
             # every later one. Fail open instead: the DB constraint still
             # dedups, and submit is the safe side.
             logger.warning(
-                "automations: matched message has no history_id "
+                "automations: matched message has no alert.id "
                 "(automation_id=%s tenant_id=%s); idempotency gate skipped",
-                message.automation_id,
-                message.tenant_id,
+                safe_log_value(message.automation_id),
+                safe_log_value(message.tenant_id),
             )
             return self._decide(
                 IdempotencyOutcome.FAIL_OPEN, key, REASON_MISSING_HISTORY_ID

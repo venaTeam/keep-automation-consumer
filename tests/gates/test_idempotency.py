@@ -48,7 +48,7 @@ MESSAGE = {
         "environment": "prod",
         "operator": "team-payments",
         "fingerprint": "abc123",
-        "history_id": HISTORY_ID,
+        "id": HISTORY_ID,
         "time_created": "2026-07-12T14:03:00Z",
     },
     "automation_id": AUTOMATION_ID,
@@ -268,12 +268,12 @@ def test_read_error_after_nx_fail_fails_open():
     assert decision.should_submit is True
 
 
-def test_message_without_history_id_fails_open_and_arms_nothing():
+def test_message_without_alert_id_fails_open_and_arms_nothing():
     """Gate-level guard. The consumer now rejects such a message before the
     gate (MalformedMessage), so this is built directly, bypassing that check."""
     redis = FakeRedis()
     alert = dict(MESSAGE["alert"])
-    alert.pop("history_id")
+    alert.pop("id")
     unvalidated = MatchedAlertMessage(
         tenant_id="keep", alert=alert, automation_id=AUTOMATION_ID
     )

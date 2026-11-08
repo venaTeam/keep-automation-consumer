@@ -55,8 +55,9 @@ Per message (spec §5.2, `src/bl/pipeline.py`):
 - **Poison** is skipped and committed past, counted in
   `deserialize_errors_total`: an unparseable message, or one no submit could
   carry — `tenant_id`/`automation_id` not a non-empty string, `alert` not an
-  object, or no `alert.history_id` (contracts §Matched message). An
-  unsettled poison message would block its partition forever. Exceptions
+  object. A missing `alert.id` is handled by the idempotency gate as a
+  fail-open delivery with `missing_history_id`; it is not used to build a
+  Redis key. An unsettled poison message would block its partition forever. Exceptions
   *inside* a submit attempt are not poison: they release the claim and retry.
 - **Redis recovery** follows the C9 breaker: after an outage the gates resume
   within one `REDIS_BREAKER_OPEN_SECONDS` window (a burst arriving during the
@@ -113,7 +114,7 @@ Suggested alert expressions for I34 (routing is I34's):
 
 ## Idempotency gate (C9)
 
-`SET idem:{history_id}:{automation_id} "pending" NX EX 24h` per message
+`SET idem:{alert.id}:{automation_id} "pending" NX EX 24h` per message
 (`automation-contracts.md` §Redis keys, spec §5.2 step 1):
 
 | Redis says | Outcome | Action |
@@ -124,7 +125,8 @@ Suggested alert expressions for I34 (routing is I34's):
 | unreachable / `REDIS_URL` unset | `fail_open` | **submit**, `gate_flags={idempotency: skipped, reason: redis_unavailable}` |
 
 The gate is an optimisation, never the authority: the API's unique
-`(history_id, automation_id)` constraint is what actually dedups, and it
+The API's `(history_id, automation_id)` constraint (where `history_id` is the
+consumer/API name for B5's `alert.id`) is what actually dedups, and it
 short-circuits to `200 already submitted` without calling `/run`. So every
 ambiguous case submits — dropping a message would trade a cheap duplicate for a
 lost automation. `done` is written only on an **API-confirmed** submit

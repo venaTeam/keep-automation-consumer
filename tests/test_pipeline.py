@@ -51,7 +51,7 @@ MESSAGE = {
         "operator": "team-payments",
         "node_name": "api-01",
         "fingerprint": "abc123",
-        "history_id": HISTORY_ID,
+        "id": HISTORY_ID,
         "time_created": "2026-07-12T14:03:00Z",
     },
     "automation_id": AUTOMATION_ID,
@@ -301,6 +301,28 @@ def test_cooldown_suppression_is_audited_settled_and_leaves_the_winner_alone():
     assert redis.values[IDEM_KEY] == "pending"
 
 
+def test_duplicate_audit_receives_raw_message_values():
+    raw_tenant = "tenant\nraw"
+    raw_automation = "automation\\u000a"
+    raw_event_id = "evt\nraw"
+    payload = json.loads(json.dumps(MESSAGE))
+    payload["tenant_id"] = raw_tenant
+    payload["automation_id"] = raw_automation
+    payload["alert"]["id"] = raw_event_id
+    redis = InMemoryRedis()
+    auditor = RecordingAuditor()
+    pipeline = build_test_pipeline(redis=redis, suppression_auditor=auditor)
+
+    first = MatchedAlertMessage.from_bytes(json.dumps(payload).encode())
+    pipeline.process_once(first, run_id=RUN_ID)
+    pipeline.process_once(first, run_id=RUN_ID)
+
+    row = auditor.rows[0]
+    assert row["tenant_id"] == raw_tenant
+    assert row["automation_id"] == raw_automation
+    assert row["history_id"] == raw_event_id
+
+
 def test_a_failing_auditor_does_not_fail_the_message(caplog):
     class AngryAuditor:
         def record_suppression(self, **_):
@@ -372,8 +394,6 @@ def test_redis_unset_submits_without_gates():
         ({"tenant_id": ""}, "tenant_id"),
         ({"automation_id": None}, "automation_id"),
         ({"alert": "not-an-object"}, "alert"),
-        ({"alert": {"site": "x"}}, "alert.history_id"),
-        ({"alert": {"history_id": None}}, "alert.history_id"),
     ],
 )
 def test_a_message_no_submit_could_carry_is_malformed(overrides, field):
@@ -450,7 +470,7 @@ def test_each_delivery_mints_a_new_run_id():
     pipeline = build_test_pipeline(redis=InMemoryRedis(), submit_client=client)
 
     pipeline.run(message(), cancelled=threading.Event())
-    other_event = {**MESSAGE["alert"], "history_id": "evt-other", "site": "eu-west-1"}
+    other_event = {**MESSAGE["alert"], "id": "evt-other", "site": "eu-west-1"}
     pipeline.run(message(alert=other_event), cancelled=threading.Event())
 
     assert client.requests[0].run_id != client.requests[1].run_id

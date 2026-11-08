@@ -1,6 +1,7 @@
 """Matched-alert message shape (contracts §"Matched message").
 
 `automation-contracts.md` is authoritative; this model follows it, never the reverse.
+The B5 wire name `alert.id` maps to the existing consumer/API name `history_id`.
 Deliberately a dependency-free dataclass: there is no shared contracts package —
 each repo mirrors only the slice of the doc it uses, kept honest by tests.
 
@@ -16,14 +17,15 @@ from typing import Optional
 @dataclass
 class MatchedAlertMessage:
     tenant_id: str         # owning tenant (a `tenant.id` value); stamped by the matcher, not in `alert`
-    alert: dict            # full alert payload snapshot (carries history_id, fingerprint, time_created)
+    alert: dict            # full alert payload snapshot (carries id, fingerprint, time_created)
     automation_id: str     # match result + Kafka partition key
     matched_m: Optional[int] = None   # observed fan-out M (M <= 3 guardrail)
     cooldown: Optional[dict] = None    # resolved cooldown config, or None when off
 
     @property
     def history_id(self) -> Optional[str]:
-        return self.alert.get("history_id")
+        """Expose B5's wire ID through the existing gate/API name."""
+        return self.alert.get("id")
 
     @property
     def fingerprint(self) -> Optional[str]:
@@ -45,11 +47,10 @@ class MatchedAlertMessage:
     def validate(self) -> None:
         """Reject a message no submit could ever carry (contracts §Matched message).
 
-        A null tenant/automation or a missing `history_id` is refused by the
-        API's request validation on every attempt, and NULL would not dedup in
-        the run table's unique key either. Retrying it would stall its
-        partition forever, so it is poison: rejected here, skipped by the
-        consumer.
+        A null tenant or automation is refused by the API's request validation.
+        Missing `alert.id` is allowed through so the idempotency gate can fail
+        open and expose the degraded delivery with its `missing_history_id`
+        reason; the gate must never build a shared key from a missing ID.
         """
         problems = []
         if not _non_empty_str(self.tenant_id):
@@ -58,8 +59,6 @@ class MatchedAlertMessage:
             problems.append("automation_id")
         if not isinstance(self.alert, dict):
             problems.append("alert")
-        elif not _non_empty_str(self.history_id):
-            problems.append("alert.history_id")
         if problems:
             raise MalformedMessage(problems)
 

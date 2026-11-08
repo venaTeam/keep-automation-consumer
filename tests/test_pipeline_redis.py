@@ -99,7 +99,7 @@ def message(automation_id, *, history_id=None, cooldown_seconds=300):
                     "site": "us-east-1",
                     "node_name": "api-01",
                     "fingerprint": "abc123",
-                    "history_id": history_id or f"evt-{uuid4()}",
+                    "id": history_id or f"evt-{uuid4()}",
                 },
                 "automation_id": automation_id,
                 "matched_m": 1,
