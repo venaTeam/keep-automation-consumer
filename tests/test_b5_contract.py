@@ -12,6 +12,7 @@ import pytest
 from src.bl.gates.idempotency import IdempotencyOutcome
 from src.models.matched_message import MatchedAlertMessage
 from tests.gates.test_idempotency import FakeRedis, gate_with
+from tests.helpers import build_test_consumer
 
 
 @pytest.fixture
@@ -67,3 +68,15 @@ def test_idless_malformed_message_replay_never_creates_shared_key(payload):
         assert decision.outcome is IdempotencyOutcome.FAIL_OPEN
         assert decision.gate_flags["reason"] == "missing_history_id"
     assert redis.calls == []
+
+
+def test_idless_golden_message_fails_open_through_consumer(payload, caplog):
+    """The full consumer path must skip Redis and continue without an ID."""
+    del payload["alert"]["id"]
+    redis = FakeRedis()
+    consumer = build_test_consumer(idempotency_gate=gate_with(redis))
+
+    consumer._handle(json.dumps(payload).encode())
+
+    assert redis.calls == []
+    assert "no alert.id" in caplog.text
